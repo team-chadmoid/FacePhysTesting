@@ -1,0 +1,28 @@
+experiment:
+  name: "FacePhys Baseline Evaluation on UBFC-RPPG Dataset 2"
+  model: "FacePhys.rlap"
+  seed: 42
+
+dataset:
+  root: "data/ubfc/Data Set 2"
+  subjects:
+    - "subject1"
+    - "subject3"
+    - "subject4"
+
+parameters:
+  fs_uniform: 30.0
+  window_sec: 30.0
+  stride_sec: 1.0
+  bandpass_low: 0.7
+  bandpass_high: 3.0
+  filter_order: 3
+  nfft_welch: 8192
+  nfft_video: 16384
+  reliability_threshold_bpm: 5.0
+
+outputs:
+  results_csv: "results/ubfc_facephys.csv"
+  preds_dir: "results/preds"
+  plots_dir: "results/plots"
+  ba_plot: "results/plots/bland_altman_facephys_across_subjects.png"
