@@ -1,0 +1,30 @@
+experiment:
+  name: "Subject 3 Ground-Truth Discrepancy & Reference Comparison"
+  description: "Diagnostic of UBFC Dataset 2 ground-truth signals (reference vs reference, not model error)"
+  seed: 42
+
+dataset:
+  root: "data/ubfc/Data Set 2"
+  subjects:
+    - "subject1"
+    - "subject3"
+    - "subject4"
+
+parameters:
+  fs: 30.0
+  window_sec: 30.0
+  stride_sec: 1.0
+  bandpass_low: 0.7
+  bandpass_high: 3.0
+  filter_order: 3
+  discrepancy_threshold_bpm: 5.0
+  spectrogram_window_sec: 8.0
+  spectrogram_overlap_sec: 7.5
+
+outputs:
+  subject_summary_csv: "results/subject_reference_comparison.csv"
+  window_comparison_csv: "results/windowed_reference_comparison.csv"
+  subject3_gaps_csv: "results/subject3_gaps_analysis.csv"
+  spectrogram_plot: "results/plots/subject3_diagnostic_spectrogram.png"
+  ba_plot_welch: "results/plots/bland_altman_across_subjects_welch_vs_oximeter.png"
+  ba_plot_peaks: "results/plots/bland_altman_across_subjects_peaks_vs_oximeter.png"

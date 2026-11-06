@@ -21,3 +21,4 @@ output:
   window_results_csv: "results/ubfc_windowed_discrepancies.csv"
   exclusions_csv: "results/exclusions.csv"
   plot_dir: "results/plots"
+

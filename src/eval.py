@@ -12,8 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from scipy import interpolate
 
 from src.hr import (
@@ -242,7 +245,76 @@ def plot_bland_altman(
     return fig
 
 
+def plot_bland_altman_across_subjects(
+    df: Any,
+    true_col: str,
+    pred_col: str,
+    subject_col: str = "subject_id",
+    res_col: Optional[str] = "resolution",
+    title: str = "Bland-Altman Across Subjects (Reference vs Reference, Not Model Error)",
+    save_path: Optional[Union[str, Path]] = None,
+) -> plt.Figure:
+    """Plot Bland-Altman across subjects (one independent point per subject).
+
+    Avoids spurious degrees-of-freedom inflation from overlapping sliding windows.
+    Labels clearly state that comparison is reference vs reference, not model error.
+
+    Args:
+        df: pandas DataFrame containing subject-level metrics.
+        true_col: Column name for ground truth reference (e.g. oximeter line HR).
+        pred_col: Column name for comparison reference (e.g. PPG-derived HR).
+        subject_col: Column for subject identifier.
+        res_col: Optional column for video resolution.
+        title: Plot title.
+        save_path: Path to save figure.
+
+    Returns:
+        matplotlib Figure.
+    """
+    y_t = np.asarray(df[true_col], dtype=np.float64)
+    y_p = np.asarray(df[pred_col], dtype=np.float64)
+
+    mean_vals = (y_t + y_p) / 2.0
+    diff = y_p - y_t
+
+    ba = calc_bland_altman(y_t, y_p)
+    bias = ba["bias"]
+    upper = ba["upper_loa"]
+    lower = ba["lower_loa"]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Plot subject points
+    for i, row in df.iterrows():
+        x = (row[true_col] + row[pred_col]) / 2.0
+        y = row[pred_col] - row[true_col]
+        sid = row[subject_col]
+        lbl = f"{sid}"
+        if res_col and res_col in row and pd.notna(row[res_col]):
+            lbl += f" ({row[res_col]})"
+        ax.scatter([x], [y], s=80, zorder=5, label=lbl)
+        ax.annotate(lbl, (x, y), textcoords="offset points", xytext=(8, 5), fontsize=9)
+
+    ax.axhline(bias, color="red", linestyle="--", linewidth=1.5, label=f"Bias: {bias:.2f} BPM")
+    ax.axhline(upper, color="gray", linestyle=":", linewidth=1.5, label=f"+1.96 SD: {upper:.2f} BPM")
+    ax.axhline(lower, color="gray", linestyle=":", linewidth=1.5, label=f"-1.96 SD: {lower:.2f} BPM")
+
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_xlabel(f"Mean of [{true_col}] and [{pred_col}] (BPM)\n(Reference vs Reference, Not Model Error)", fontsize=10)
+    ax.set_ylabel(f"[{pred_col}] - [{true_col}] (BPM)", fontsize=10)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=300, bbox_inches="tight")
+
+    return fig
+
+
 def log_exclusion(
+
     subject_id: str,
     reason: str,
     exclusions_file: Union[str, Path] = "results/exclusions.csv",
@@ -261,3 +333,4 @@ def log_exclusion(
     else:
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
+

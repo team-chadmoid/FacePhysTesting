@@ -9,6 +9,11 @@ from src.hr import (
     estimate_hr_from_bvp,
     estimate_hr_windowed,
     estimate_hr_video,
+    detect_peaks_ppg,
+    hr_from_peaks,
+    estimate_hr_peaks_windowed,
+    estimate_hr_raw_frames,
+    estimate_hr_windowed_raw_frames,
 )
 
 
@@ -104,3 +109,33 @@ def test_estimate_hr_video():
     hr_vid = estimate_hr_video(sig, fs=fs, time=t)
     assert isinstance(hr_vid, float)
     assert abs(hr_vid - 78.5) < 0.2
+
+
+@pytest.mark.parametrize("target_bpm", [60.0, 75.0, 90.0, 120.0])
+def test_hr_from_peaks_synthetic(target_bpm):
+    """Verify peak-based HR estimator on synthetic pulse signals."""
+    fs = 30.0
+    np.random.seed(42)
+    t, sig = generate_synthetic_sinusoid(bpm=target_bpm, fs=fs, duration_sec=40.0, snr_db=35.0, harmonics=False)
+    est_bpm = hr_from_peaks(sig, fs=fs, time=t)
+    assert abs(est_bpm - target_bpm) < 1.0, f"Expected {target_bpm}, got {est_bpm}"
+
+
+def test_estimate_hr_peaks_windowed():
+    """Verify windowed peak-based HR estimator."""
+    fs = 30.0
+    np.random.seed(42)
+    t, sig = generate_synthetic_sinusoid(bpm=80.0, fs=fs, duration_sec=60.0, snr_db=35.0, harmonics=False)
+    win_times, win_hrs = estimate_hr_peaks_windowed(sig, fs=fs, time=t, window_sec=30.0, stride_sec=1.0)
+    assert len(win_hrs) == 31
+    assert np.all(np.abs(win_hrs - 80.0) < 1.0)
+
+
+def test_estimate_hr_raw_frames():
+    """Verify raw frame estimation works."""
+    fs = 30.0
+    t, sig = generate_synthetic_sinusoid(bpm=90.0, fs=fs, duration_sec=45.0, snr_db=30.0)
+    hr_raw = estimate_hr_raw_frames(sig, fs_nominal=fs)
+    assert abs(hr_raw - 90.0) < 0.2
+
+
