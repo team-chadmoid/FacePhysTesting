@@ -1,0 +1,23 @@
+dataset:
+  name: "UBFC-RPPG Dataset 2"
+  root: "data/ubfc/Data Set 2"
+  subjects:
+    - "subject1"
+    - "subject3"
+    - "subject4"
+
+evaluation:
+  fs: 30.0
+  window_sec: 30.0
+  stride_sec: 1.0
+  bandpass_low: 0.7
+  bandpass_high: 3.0
+  filter_order: 3
+  discrepancy_threshold_bpm: 5.0
+  seed: 42
+
+output:
+  results_csv: "results/ubfc_alignment_verification.csv"
+  window_results_csv: "results/ubfc_windowed_discrepancies.csv"
+  exclusions_csv: "results/exclusions.csv"
+  plot_dir: "results/plots"
