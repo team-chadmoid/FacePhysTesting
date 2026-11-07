@@ -64,55 +64,86 @@ def get_git_hash() -> str:
         return "UNKNOWN"
 
 
-def find_lowlight_directories(root_dir: Path) -> List[Dict[str, Path]]:
-    """Recursively discover all video/GT subject folders under root_dir.
+def find_lowlight_directories(root_dir: Path, original_dir: Optional[Path] = None) -> List[Dict[str, Path]]:
+    """Recursively discover all video/GT subject folders under root_dir and optional original_dir.
+
+    Uses os.walk(followlinks=True) so Google Drive shortcuts / symlinks are traversed.
+    Standardizes conditions (e.g. 'Data Set 2' / 'original' -> 'original_baseline').
 
     Returns a list of dicts:
-        - condition: name of variation (e.g. 'original', '50lux', '30lux')
+        - condition: name of variation (e.g. 'original_baseline', '50lux', '30lux')
         - subject_id: subject name (e.g. 'subject1')
         - subject_dir: Path to directory
         - gt_path: Path to ground_truth.txt
         - video_path: Path to video file (.avi / .mp4)
     """
     entries = []
-    if not root_dir.is_dir():
-        return entries
 
-    gt_files = list(root_dir.glob("**/ground_truth.txt"))
-    for gt_path in gt_files:
-        sdir = gt_path.parent
-        # Find video in the same directory
-        vids = list(sdir.glob("*.avi")) + list(sdir.glob("*.mp4"))
-        if not vids:
-            continue
-        vid_path = vids[0]
+    # 1. Walk root_dir with followlinks=True
+    if root_dir.is_dir():
+        for root, dirs, files in os.walk(str(root_dir), followlinks=True):
+            if "ground_truth.txt" in files:
+                sdir = Path(root)
+                vids = [sdir / f for f in files if f.endswith(".avi") or f.endswith(".mp4")]
+                if not vids:
+                    continue
+                vid_path = vids[0]
+                gt_path = sdir / "ground_truth.txt"
 
-        # Determine condition and subject_id from relative path
-        rel_parts = sdir.relative_to(root_dir).parts
-        if len(rel_parts) >= 2:
-            condition = rel_parts[0]
-            subj_id = rel_parts[-1]
-        elif len(rel_parts) == 1:
-            condition = "default"
-            subj_id = rel_parts[0]
-        else:
-            condition = "root"
-            subj_id = sdir.name
+                # Determine condition from relative path
+                try:
+                    rel_parts = sdir.relative_to(root_dir).parts
+                except ValueError:
+                    rel_parts = (sdir.name,)
 
-        # Clean subject_id
-        match = re.search(r"subject\d+", subj_id, re.IGNORECASE)
-        if match:
-            clean_sub = match.group(0).lower()
-        else:
-            clean_sub = subj_id.lower()
+                if len(rel_parts) >= 2:
+                    raw_cond = rel_parts[0]
+                    subj_name = rel_parts[-1]
+                elif len(rel_parts) == 1:
+                    raw_cond = "default"
+                    subj_name = rel_parts[0]
+                else:
+                    raw_cond = "root"
+                    subj_name = sdir.name
 
-        entries.append({
-            "condition": condition,
-            "subject_id": clean_sub,
-            "subject_dir": sdir,
-            "gt_path": gt_path,
-            "video_path": vid_path,
-        })
+                # Standardize condition name
+                cond_clean = raw_cond.lower().replace("_", " ").replace("-", " ")
+                if any(x in cond_clean for x in ["data set 2", "dataset 2", "dataset2", "original", "baseline"]):
+                    condition = "original_baseline"
+                else:
+                    condition = raw_cond
+
+                match = re.search(r"subject\d+", subj_name, re.IGNORECASE)
+                clean_sub = match.group(0).lower() if match else subj_name.lower()
+
+                entries.append({
+                    "condition": condition,
+                    "subject_id": clean_sub,
+                    "subject_dir": sdir,
+                    "gt_path": gt_path,
+                    "video_path": vid_path,
+                })
+
+    # 2. Walk original_dir if provided separately
+    if original_dir and original_dir.is_dir():
+        existing_orig_subs = {e["subject_id"] for e in entries if e["condition"] == "original_baseline"}
+        for root, dirs, files in os.walk(str(original_dir), followlinks=True):
+            if "ground_truth.txt" in files:
+                sdir = Path(root)
+                vids = [sdir / f for f in files if f.endswith(".avi") or f.endswith(".mp4")]
+                if not vids:
+                    continue
+                match = re.search(r"subject\d+", sdir.name, re.IGNORECASE)
+                clean_sub = match.group(0).lower() if match else sdir.name.lower()
+                if clean_sub not in existing_orig_subs:
+                    entries.append({
+                        "condition": "original_baseline",
+                        "subject_id": clean_sub,
+                        "subject_dir": sdir,
+                        "gt_path": sdir / "ground_truth.txt",
+                        "video_path": vids[0],
+                    })
+                    existing_orig_subs.add(clean_sub)
 
     # Sort by condition and subject
     entries.sort(key=lambda x: (x["condition"], x["subject_id"]))
@@ -122,7 +153,8 @@ def find_lowlight_directories(root_dir: Path) -> List[Dict[str, Path]]:
 def main():
     parser = argparse.ArgumentParser(description="Evaluate FacePhys on UBFC low-light variations.")
     parser.add_argument("--config", type=str, default="configs/colab_lowlight.yaml", help="Path to config file")
-    parser.add_argument("--data-dir", type=str, default=None, help="Override root directory of dataset")
+    parser.add_argument("--data-dir", type=str, default=None, help="Root directory of UBFC_lowlight")
+    parser.add_argument("--original-dir", type=str, default=None, help="Directory of original Data Set 2 if shortcut or stored separately")
     args = parser.parse_args()
 
     git_hash = get_git_hash()
@@ -151,7 +183,33 @@ def main():
         else:
             data_root = colab_path
 
-    print(f"Looking for dataset in: {data_root}")
+    # Check original dataset directory
+    orig_root: Optional[Path] = None
+    if args.original_dir:
+        orig_root = Path(args.original_dir)
+    else:
+        cfg_orig = cfg.get("dataset", {}).get("original_dir")
+        if cfg_orig and Path(cfg_orig).is_dir():
+            orig_root = Path(cfg_orig)
+        else:
+            # Check common Colab MyDrive paths for Data Set 2
+            candidates = [
+                Path("/content/drive/MyDrive/Data Set 2"),
+                Path("/content/drive/MyDrive/UBFC/Data Set 2"),
+                Path("/content/drive/MyDrive/DATASET_2"),
+                PROJECT_ROOT / "data/ubfc/Data Set 2",
+            ]
+            for cand in candidates:
+                if cand.is_dir():
+                    orig_root = cand
+                    break
+
+    print(f"Looking for low-light dataset in: {data_root}")
+    if orig_root:
+        print(f"Original dataset found in: {orig_root}")
+    else:
+        print("Note: Original dataset folder not specified separately; scanning low-light root for all conditions/shortcuts.")
+
     if not data_root.is_dir():
         print(f"ERROR: Dataset directory '{data_root}' not found!")
         print("In Google Colab, please make sure you ran:")
@@ -159,7 +217,7 @@ def main():
         print("and added 'UBFC_lowlight' to My Drive (Right click folder -> Organize -> Add shortcut -> My Drive).")
         sys.exit(1)
 
-    entries = find_lowlight_directories(data_root)
+    entries = find_lowlight_directories(data_root, original_dir=orig_root)
     if not entries:
         print(f"No valid subjects with ground_truth.txt and video files found in {data_root}.")
         sys.exit(1)
@@ -329,3 +387,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

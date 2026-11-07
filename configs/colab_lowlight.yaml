@@ -4,8 +4,9 @@ seed: 42
 
 dataset:
   # In Colab: /content/drive/MyDrive/UBFC_lowlight
-  # Local fallback: data/ubfc/UBFC_lowlight
   root_dir: "/content/drive/MyDrive/UBFC_lowlight"
+  # Path to original Data Set 2 if shortcut or mounted separately in My Drive
+  original_dir: "/content/drive/MyDrive/Data Set 2"
   fallback_local_dir: "data/ubfc/UBFC_lowlight"
 
 parameters:
@@ -25,3 +26,4 @@ outputs:
   preds_dir: "results/preds"
   plots_dir: "results/plots"
   summary_csv: "results/ubfc_lowlight_conditions.csv"
+
