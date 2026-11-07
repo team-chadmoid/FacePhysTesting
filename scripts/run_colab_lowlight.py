@@ -1,7 +1,7 @@
 """Evaluate FacePhys baseline across UBFC low-light variations (Condition C1).
 
 Supports Google Colab (mounted Drive) and local execution.
-Discovers all conditions (e.g. original, 50lux, 30lux, etc.) and subjects dynamically.
+Discovers all conditions (e.g. original_baseline, lux50, lux30, lux10, lux5, lux1) and subjects dynamically.
 Calculates:
 - Video HR error vs Primary (Welch GT PPG) and Secondary (oximeter line)
 - Windowed MAE, MedAE, RMSE, Pearson r, and Fraction <= 5 BPM (all and reliable windows)
@@ -10,15 +10,39 @@ Calculates:
 Outputs:
 - results/preds/{condition}_{subject}_pred.csv
 - results/ubfc_lowlight_conditions.csv
+- results/exclusions.csv (logs any excluded/failed subject per AGENTS.md rule 4)
+
+Memory safety & Subprocess Isolation:
+- FacePhys (JAX / Mamba SSM) creates background threads and C-extension buffers.
+  Running hundreds of subjects in a single Python process corrupts glibc heap metadata,
+  resulting in ``malloc(): invalid size (unsorted)`` or SIGABRT after ~150-180 subjects.
+- Fix: Each subject is executed in a fresh isolated worker subprocess (via ``--worker``).
+  When the worker finishes inference and writes its JSON result, the OS kernel reclaims
+  100% of heap allocations and thread resources. The coordinator process never accumulates
+  memory across subjects.
+
+Duplicate Subject Handling:
+- In UBFC low-light, the lux folders (lux1, lux5, lux10, lux30, lux50) contain duplicate
+  recordings/folders for: subject22, subject31, and subject34 (45 folders per lux condition:
+  42 unique base subjects + 3 duplicate entries).
+- In DATASET_2 (original_baseline), these 3 subjects only appear once (42 folders total).
+- The discovery pipeline disambiguates duplicates deterministically by assigning
+  ``{subject}_dup1`` (e.g. subject22_dup1, subject31_dup1, subject34_dup1) so that no
+  prediction CSV or summary CSV row is overwritten or skipped on resume.
+- Grand total: 5 x 45 (lux) + 42 (original) = 267 runs.
 """
 
 import argparse
+import gc
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib
@@ -51,7 +75,6 @@ from src.hr import (
     estimate_hr_windowed,
 )
 from src.io import load_ubfc_ground_truth, resample_to_uniform
-from src.models import FacePhysWrapper, predict_bvp
 
 
 def get_git_hash() -> str:
@@ -64,90 +87,343 @@ def get_git_hash() -> str:
         return "UNKNOWN"
 
 
-def find_lowlight_directories(root_dir: Path, original_dir: Optional[Path] = None) -> List[Dict[str, Path]]:
+def log_exclusion(subject_id: str, reason: str, exclusions_csv: Path) -> None:
+    """Log an excluded or failed video to results/exclusions.csv per AGENTS.md rule 4."""
+    exclusions_csv.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "subject_id": subject_id,
+        "reason": reason.replace(",", ";"),
+        "timestamp": pd.Timestamp.now().isoformat(),
+    }
+    df_new = pd.DataFrame([row])
+    if not exclusions_csv.is_file():
+        df_new.to_csv(exclusions_csv, index=False)
+    else:
+        df_new.to_csv(exclusions_csv, mode="a", header=False, index=False)
+
+
+def normalize_condition_name(raw_name: str) -> str:
+    """Normalize directory string to standardized condition name.
+    
+    Examples:
+        '50lux', 'lux50', 'lux_50' -> 'lux50'
+        'DATASET_2', 'Data Set 2', 'original', 'baseline' -> 'original_baseline'
+    """
+    clean = raw_name.lower().replace("_", " ").replace("-", " ").strip()
+    if any(x in clean for x in ["data set 2", "dataset 2", "dataset2", "original", "baseline"]):
+        return "original_baseline"
+    
+    # Check for lux pattern: e.g. 50lux or lux50
+    m_num_first = re.search(r"(\d+)\s*lux", clean)
+    if m_num_first:
+        return f"lux{m_num_first.group(1)}"
+    m_lux_first = re.search(r"lux\s*(\d+)", clean)
+    if m_lux_first:
+        return f"lux{m_lux_first.group(1)}"
+    
+    return raw_name.strip()
+
+
+def find_lowlight_directories(root_dir: Path, original_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     """Recursively discover all video/GT subject folders under root_dir and optional original_dir.
 
-    Uses os.walk(followlinks=True) so Google Drive shortcuts / symlinks are traversed.
-    Standardizes conditions (e.g. 'Data Set 2' / 'original' -> 'original_baseline').
+    Handles:
+    - Follows Google Drive shortcuts / symlinks (followlinks=True).
+    - Case-insensitive video and GT file extensions (.avi, .mp4, .mov, etc.).
+    - Disambiguates duplicate entries (e.g. subject22, subject31, subject34 in lux folders)
+      by deterministically naming subsequent occurrences '{subject}_dup1', '{subject}_dup2'.
+    - Discovers 267 total runs (225 lux [45 x 5] + 42 original_baseline).
 
     Returns a list of dicts:
-        - condition: name of variation (e.g. 'original_baseline', '50lux', '30lux')
-        - subject_id: subject name (e.g. 'subject1')
+        - condition: standardized condition (e.g. 'lux50', 'original_baseline')
+        - subject_id: unique subject identifier (e.g. 'subject1', 'subject22_dup1')
+        - base_subject_id: base subject name (e.g. 'subject22')
+        - is_duplicate: True if this is a secondary duplicate recording
         - subject_dir: Path to directory
         - gt_path: Path to ground_truth.txt
-        - video_path: Path to video file (.avi / .mp4)
+        - video_path: Path to video file
     """
-    entries = []
-
-    # 1. Walk root_dir with followlinks=True
+    search_roots: List[Path] = []
     if root_dir.is_dir():
-        for root, dirs, files in os.walk(str(root_dir), followlinks=True):
-            if "ground_truth.txt" in files:
-                sdir = Path(root)
-                vids = [sdir / f for f in files if f.endswith(".avi") or f.endswith(".mp4")]
-                if not vids:
-                    continue
-                vid_path = vids[0]
-                gt_path = sdir / "ground_truth.txt"
+        search_roots.append(root_dir)
+    
+    if original_dir and original_dir.is_dir() and original_dir not in search_roots:
+        search_roots.append(original_dir)
+    
+    # If DATASET_2 is sibling to root_dir in Drive, include it if not already found
+    if root_dir.is_dir() and root_dir.parent.is_dir():
+        for sibling_name in ["DATASET_2", "Data Set 2", "dataset_2"]:
+            cand = root_dir.parent / sibling_name
+            if cand.is_dir() and cand not in search_roots:
+                search_roots.append(cand)
 
-                # Determine condition from relative path
-                try:
-                    rel_parts = sdir.relative_to(root_dir).parts
-                except ValueError:
-                    rel_parts = (sdir.name,)
+    vid_exts = (".avi", ".mp4", ".mov", ".mkv", ".m4v")
+    raw_discovered: List[Dict[str, Any]] = []
 
+    for sroot in search_roots:
+        for root, dirs, files in os.walk(str(sroot), followlinks=True):
+            gt_matches = [f for f in files if f.lower() in ("ground_truth.txt", "groundtruth.txt", "gt.txt")]
+            if not gt_matches:
+                continue
+            
+            vid_matches = [f for f in files if f.lower().endswith(vid_exts)]
+            if not vid_matches:
+                continue
+            
+            sdir = Path(root)
+            gt_path = sdir / gt_matches[0]
+            # Prefer vid.avi / vid.mp4 if available, otherwise first match
+            preferred_vids = [f for f in vid_matches if f.lower().startswith("vid")]
+            vid_path = sdir / (preferred_vids[0] if preferred_vids else vid_matches[0])
+
+            # Determine condition from path relative to sroot
+            try:
+                rel_parts = sdir.relative_to(sroot).parts
+            except ValueError:
+                rel_parts = (sdir.name,)
+
+            # Check rel_parts for condition keyword
+            detected_cond = None
+            for part in rel_parts:
+                norm_part = normalize_condition_name(part)
+                if norm_part in ("original_baseline", "lux1", "lux5", "lux10", "lux30", "lux50"):
+                    detected_cond = norm_part
+                    break
+
+            if detected_cond is None:
                 if len(rel_parts) >= 2:
-                    raw_cond = rel_parts[0]
-                    subj_name = rel_parts[-1]
-                elif len(rel_parts) == 1:
-                    raw_cond = "default"
-                    subj_name = rel_parts[0]
+                    detected_cond = normalize_condition_name(rel_parts[0])
                 else:
-                    raw_cond = "root"
-                    subj_name = sdir.name
+                    detected_cond = normalize_condition_name(sroot.name)
 
-                # Standardize condition name
-                cond_clean = raw_cond.lower().replace("_", " ").replace("-", " ")
-                if any(x in cond_clean for x in ["data set 2", "dataset 2", "dataset2", "original", "baseline"]):
-                    condition = "original_baseline"
-                else:
-                    condition = raw_cond
+            # Determine base subject name
+            match = re.search(r"subject\s*(\d+)", sdir.name, re.IGNORECASE)
+            if not match and len(rel_parts) >= 2:
+                # Check parent folder name if sdir is nested
+                match = re.search(r"subject\s*(\d+)", rel_parts[-1], re.IGNORECASE)
+            
+            if match:
+                base_sub = f"subject{int(match.group(1))}"
+            else:
+                base_sub = sdir.name.lower()
 
-                match = re.search(r"subject\d+", subj_name, re.IGNORECASE)
-                clean_sub = match.group(0).lower() if match else subj_name.lower()
+            raw_discovered.append({
+                "condition": detected_cond,
+                "base_subject_id": base_sub,
+                "subject_dir": sdir,
+                "gt_path": gt_path,
+                "video_path": vid_path,
+            })
 
-                entries.append({
-                    "condition": condition,
-                    "subject_id": clean_sub,
-                    "subject_dir": sdir,
-                    "gt_path": gt_path,
-                    "video_path": vid_path,
-                })
+    # Sort deterministically by condition, base_subject_id, and str(subject_dir)
+    raw_discovered.sort(key=lambda x: (x["condition"], x["base_subject_id"], str(x["subject_dir"])))
 
-    # 2. Walk original_dir if provided separately
-    if original_dir and original_dir.is_dir():
-        existing_orig_subs = {e["subject_id"] for e in entries if e["condition"] == "original_baseline"}
-        for root, dirs, files in os.walk(str(original_dir), followlinks=True):
-            if "ground_truth.txt" in files:
-                sdir = Path(root)
-                vids = [sdir / f for f in files if f.endswith(".avi") or f.endswith(".mp4")]
-                if not vids:
-                    continue
-                match = re.search(r"subject\d+", sdir.name, re.IGNORECASE)
-                clean_sub = match.group(0).lower() if match else sdir.name.lower()
-                if clean_sub not in existing_orig_subs:
-                    entries.append({
-                        "condition": "original_baseline",
-                        "subject_id": clean_sub,
-                        "subject_dir": sdir,
-                        "gt_path": sdir / "ground_truth.txt",
-                        "video_path": vids[0],
-                    })
-                    existing_orig_subs.add(clean_sub)
+    # Deduplicate / disambiguate duplicate entries per condition
+    entries: List[Dict[str, Any]] = []
+    seen_in_cond: Dict[Tuple[str, str], int] = {}
+    duplicate_logs: List[str] = []
 
-    # Sort by condition and subject
-    entries.sort(key=lambda x: (x["condition"], x["subject_id"]))
+    for item in raw_discovered:
+        cond = item["condition"]
+        base_sub = item["base_subject_id"]
+        key = (cond, base_sub)
+
+        count = seen_in_cond.get(key, 0) + 1
+        seen_in_cond[key] = count
+
+        if count == 1:
+            unique_sub_id = base_sub
+            is_dup = False
+        else:
+            unique_sub_id = f"{base_sub}_dup{count - 1}"
+            is_dup = True
+            duplicate_logs.append(
+                f"  [DISAMBIGUATED] Condition '{cond}': '{base_sub}' duplicate #{count - 1} "
+                f"-> assigned unique subject_id='{unique_sub_id}' (path: {item['subject_dir'].name})"
+            )
+
+        entries.append({
+            "condition": cond,
+            "subject_id": unique_sub_id,
+            "base_subject_id": base_sub,
+            "is_duplicate": is_dup,
+            "subject_dir": item["subject_dir"],
+            "gt_path": item["gt_path"],
+            "video_path": item["video_path"],
+        })
+
+    # Print duplicate disambiguation info if any
+    if duplicate_logs:
+        print("\nDisambiguated duplicate subject entries:")
+        for log_line in duplicate_logs:
+            print(log_line)
+
     return entries
+
+
+def run_worker_task(
+    condition: str,
+    subject_id: str,
+    video_path: Path,
+    gt_path: Path,
+    output_json: Path,
+    config_path: Path,
+    git_hash: str,
+) -> None:
+    """Isolated worker function executing one subject video and saving metrics JSON.
+    
+    This function is executed inside a fresh subprocess to prevent memory leaks and
+    glibc allocator corruption across hundreds of sequential runs.
+    """
+    # Load config inside worker
+    if config_path.is_file():
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    else:
+        cfg = {}
+
+    params = cfg.get("parameters", {})
+    fs_u = float(params.get("fs_uniform", 30.0))
+    win_sec = float(params.get("window_sec", 30.0))
+    stride_sec = float(params.get("stride_sec", 1.0))
+    lowcut = float(params.get("bandpass_low", 0.7))
+    highcut = float(params.get("bandpass_high", 3.0))
+    order = int(params.get("filter_order", 3))
+    thresh_bpm = float(params.get("reliability_threshold_bpm", 5.0))
+    snr_delta = float(params.get("snr_delta_hz", 0.1))
+    max_lag = float(params.get("lag_search_max_sec", 2.0))
+
+    preds_dir = PROJECT_ROOT / cfg.get("outputs", {}).get("preds_dir", "results/preds")
+    preds_dir.mkdir(parents=True, exist_ok=True)
+
+    # Import FacePhys model ONLY inside isolated worker subprocess
+    from src.models import predict_bvp
+
+    # Load GT (returns ppg, hr, time)
+    ppg_gt, hr_gt, t_gt = load_ubfc_ground_truth(gt_path)
+
+    # Run FacePhys inference
+    bvp_u, t_u, meta = predict_bvp(
+        video_path=video_path,
+        timestamps=t_gt,
+        fs_target=fs_u,
+        model_name="FacePhys.rlap",
+    )
+
+    # Save prediction CSV
+    clean_cond = re.sub(r"[^\w\-]", "_", condition)
+    pred_csv = preds_dir / f"{clean_cond}_{subject_id}_facephys_pred.csv"
+    raw_bvp = meta.get("raw_bvp", bvp_u)
+    raw_ts = meta.get("raw_timestamps", None)
+    if raw_ts is None or len(raw_ts) != len(raw_bvp):
+        if len(t_gt) == len(raw_bvp):
+            raw_ts = t_gt
+        else:
+            raw_ts = np.arange(len(raw_bvp)) / fs_u
+
+    min_len = min(len(raw_bvp), len(raw_ts))
+    df_pred = pd.DataFrame({
+        "frame_idx": np.arange(min_len),
+        "gt_timestamp_sec": np.asarray(raw_ts)[:min_len],
+        "facephys_bvp_raw": np.asarray(raw_bvp)[:min_len],
+    })
+    df_pred.to_csv(pred_csv, index=False)
+
+    # Resample GT to uniform time grid
+    _, ppg_u = resample_to_uniform(t_gt, ppg_gt, target_fs=fs_u)
+    _, hr_line_u = resample_to_uniform(t_gt, hr_gt, target_fs=fs_u, method="linear")
+
+    common_len = min(len(bvp_u), len(ppg_u), len(hr_line_u))
+    bvp_u = bvp_u[:common_len]
+    ppg_u = ppg_u[:common_len]
+    hr_line_u = hr_line_u[:common_len]
+
+    # Video-level HR
+    hr_pred_vid, f_pred, psd_pred = estimate_hr_welch(
+        butterworth_bandpass_filter(bvp_u, fs=fs_u, lowcut=lowcut, highcut=highcut, order=order),
+        fs=fs_u,
+        low_bpm=lowcut * 60.0,
+        high_bpm=highcut * 60.0,
+        nfft=16384,
+    )
+    primary_ref_hr = estimate_hr_video(ppg_u, fs=fs_u)
+    secondary_ref_hr = float(np.mean(hr_line_u))
+
+    # Spectral metrics
+    snr_prim = calculate_snr(psd_pred, f_pred, ref_hr_bpm=primary_ref_hr, delta_hz=snr_delta)
+    snr_sec = calculate_snr(psd_pred, f_pred, ref_hr_bpm=secondary_ref_hr, delta_hz=snr_delta)
+    peaks = get_top_spectral_peaks(psd_pred, f_pred, n_peaks=3)
+    lag_res = max_lag_waveform_correlation(bvp_u, ppg_u, fs=fs_u, max_lag_sec=max_lag)
+
+    # Windowed evaluation
+    _, hr_p_win = estimate_hr_windowed(bvp_u, fs=fs_u, window_sec=win_sec, stride_sec=stride_sec)
+    _, hr_prim_win = estimate_hr_windowed(ppg_u, fs=fs_u, window_sec=win_sec, stride_sec=stride_sec)
+
+    win_samp = int(round(win_sec * fs_u))
+    stride_samp = int(round(stride_sec * fs_u))
+    hr_sec_win = []
+    for st in range(0, len(hr_line_u) - win_samp + 1, stride_samp):
+        hr_sec_win.append(float(np.mean(hr_line_u[st:st + win_samp])))
+    hr_sec_win = np.array(hr_sec_win)
+
+    w_len = min(len(hr_p_win), len(hr_prim_win), len(hr_sec_win))
+    hr_p_sub = hr_p_win[:w_len]
+    hr_prim_sub = hr_prim_win[:w_len]
+    hr_sec_sub = hr_sec_win[:w_len]
+
+    # All windows
+    mae_all_prim = calc_mae(hr_prim_sub, hr_p_sub)
+    medae_all_prim = calc_medae(hr_prim_sub, hr_p_sub)
+    rmse_all_prim = calc_rmse(hr_prim_sub, hr_p_sub)
+    r_all_prim = calc_pearson_r(hr_prim_sub, hr_p_sub)
+    acc5_all_prim = calc_fraction_within_threshold(hr_prim_sub, hr_p_sub, threshold=thresh_bpm)
+
+    # Reliable windows (|Primary - Secondary| <= 5 BPM)
+    rel_mask = np.abs(hr_prim_sub - hr_sec_sub) <= thresh_bpm
+    n_rel = int(np.sum(rel_mask))
+
+    if n_rel > 0:
+        mae_rel_prim = calc_mae(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
+        medae_rel_prim = calc_medae(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
+        rmse_rel_prim = calc_rmse(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
+        r_rel_prim = calc_pearson_r(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
+        acc5_rel_prim = calc_fraction_within_threshold(hr_prim_sub[rel_mask], hr_p_sub[rel_mask], threshold=thresh_bpm)
+    else:
+        mae_rel_prim = medae_rel_prim = rmse_rel_prim = r_rel_prim = acc5_rel_prim = float("nan")
+
+    row_dict = {
+        "git_hash": git_hash,
+        "condition": condition,
+        "subject_id": subject_id,
+        "video_path": str(video_path),
+        "resolution": f"{meta.get('video_width', 'unknown')}x{meta.get('video_height', 'unknown')}",
+        "face_detected_ratio": meta.get("face_detected_ratio", 1.0),
+        "video_hr_pred_bpm": float(hr_pred_vid),
+        "primary_ref_hr_bpm": float(primary_ref_hr),
+        "secondary_ref_hr_bpm": float(secondary_ref_hr),
+        "video_error_vs_primary_bpm": float(abs(hr_pred_vid - primary_ref_hr)),
+        "snr_primary_db": float(snr_prim),
+        "waveform_lag_max_r": float(lag_res["max_r"]),
+        "waveform_optimal_lag_sec": float(lag_res["optimal_lag_sec"]),
+        "peak1_bpm": float(peaks[0]["freq_bpm"]) if len(peaks) > 0 else float("nan"),
+        "peak1_rel_power_inband": float(peaks[0]["rel_power_inband"]) if len(peaks) > 0 else float("nan"),
+        "all_windows_count": int(w_len),
+        "all_win_mae_vs_primary": float(mae_all_prim),
+        "all_win_medae_vs_primary": float(medae_all_prim),
+        "all_win_rmse_vs_primary": float(rmse_all_prim),
+        "all_win_r_vs_primary": float(r_all_prim),
+        "all_win_acc5_vs_primary": float(acc5_all_prim),
+        "reliable_windows_count": int(n_rel),
+        "reliable_win_mae_vs_primary": float(mae_rel_prim),
+        "reliable_win_medae_vs_primary": float(medae_rel_prim),
+        "reliable_win_rmse_vs_primary": float(rmse_rel_prim),
+        "reliable_win_r_vs_primary": float(r_rel_prim),
+        "reliable_win_acc5_vs_primary": float(acc5_rel_prim),
+    }
+
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(row_dict, f, indent=2)
 
 
 def main():
@@ -158,9 +434,32 @@ def main():
     parser.add_argument("--conditions", nargs="+", default=None, help="Filter specific conditions (e.g. lux50 lux30 original_baseline)")
     parser.add_argument("--subjects", nargs="+", default=None, help="Filter specific subjects (e.g. subject1 subject3 subject4)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of subject runs to process")
+    parser.add_argument("--no-subprocess", action="store_true", help="Run directly in-process instead of spawning isolated worker processes")
+
+    # Internal worker mode flags
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-condition", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-subject-id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-video-path", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-gt-path", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-output-json", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     git_hash = get_git_hash()
+
+    # Worker dispatch branch: run single isolated subject and exit cleanly
+    if args.worker:
+        run_worker_task(
+            condition=args.worker_condition,
+            subject_id=args.worker_subject_id,
+            video_path=Path(args.worker_video_path),
+            gt_path=Path(args.worker_gt_path),
+            output_json=Path(args.worker_output_json),
+            config_path=PROJECT_ROOT / args.config,
+            git_hash=git_hash,
+        )
+        sys.exit(0)
+
     print("=" * 80)
     print("=== FacePhys Evaluation on UBFC Low-Light (C1 Condition) ===")
     print(f"Git commit hash: {git_hash}")
@@ -186,7 +485,6 @@ def main():
         else:
             data_root = colab_path
 
-    # Check original dataset directory
     orig_root: Optional[Path] = None
     if args.original_dir:
         orig_root = Path(args.original_dir)
@@ -195,7 +493,6 @@ def main():
         if cfg_orig and Path(cfg_orig).is_dir():
             orig_root = Path(cfg_orig)
         else:
-            # Check common Colab MyDrive paths for Data Set 2
             candidates = [
                 Path("/content/drive/MyDrive/Data Set 2"),
                 Path("/content/drive/MyDrive/UBFC/Data Set 2"),
@@ -210,14 +507,12 @@ def main():
     print(f"Looking for low-light dataset in: {data_root}")
     if orig_root:
         print(f"Original dataset found in: {orig_root}")
-    else:
-        print("Note: Original dataset folder not specified separately; scanning low-light root for all conditions/shortcuts.")
 
     if not data_root.is_dir():
         print(f"ERROR: Dataset directory '{data_root}' not found!")
         print("In Google Colab, please make sure you ran:")
         print("  from google.colab import drive; drive.mount('/content/drive')")
-        print("and added 'UBFC_lowlight' to My Drive (Right click folder -> Organize -> Add shortcut -> My Drive).")
+        print("and added 'UBFC_lowlight' to My Drive.")
         sys.exit(1)
 
     entries = find_lowlight_directories(data_root, original_dir=orig_root)
@@ -229,29 +524,37 @@ def main():
     if args.conditions:
         entries = [e for e in entries if e["condition"] in args.conditions]
     if args.subjects:
-        entries = [e for e in entries if e["subject_id"] in args.subjects]
+        entries = [e for e in entries if e["subject_id"] in args.subjects or e["base_subject_id"] in args.subjects]
     if args.limit:
         entries = entries[:args.limit]
 
-    print(f"Found {len(entries)} subject runs to process:")
+    # Discovery summary breakdown
     conditions_found = sorted(list(set(e["condition"] for e in entries)))
-    print(f"Conditions: {conditions_found}")
+    print("\n" + "=" * 80)
+    print("=== Dataset Discovery Summary ===")
+    lux_total = 0
+    orig_total = 0
+    for cond in conditions_found:
+        cond_entries = [e for e in entries if e["condition"] == cond]
+        dup_entries = [e for e in cond_entries if e["is_duplicate"]]
+        dup_desc = f" ({len(dup_entries)} duplicate recordings: {', '.join(e['subject_id'] for e in dup_entries)})" if dup_entries else ""
+        print(f"  • Condition '{cond}': {len(cond_entries)} subjects{dup_desc}")
+        if cond == "original_baseline":
+            orig_total += len(cond_entries)
+        else:
+            lux_total += len(cond_entries)
 
-    params = cfg.get("parameters", {})
-    fs_u = float(params.get("fs_uniform", 30.0))
-    win_sec = float(params.get("window_sec", 30.0))
-    stride_sec = float(params.get("stride_sec", 1.0))
-    lowcut = float(params.get("bandpass_low", 0.7))
-    highcut = float(params.get("bandpass_high", 3.0))
-    order = int(params.get("filter_order", 3))
-    thresh_bpm = float(params.get("reliability_threshold_bpm", 5.0))
-    snr_delta = float(params.get("snr_delta_hz", 0.1))
-    max_lag = float(params.get("lag_search_max_sec", 2.0))
+    print("-" * 80)
+    print(f"Total runs to process: {len(entries)} (Lux: {lux_total}, Original: {orig_total})")
+    if len(entries) == 267:
+        print("  ✓ Full dataset confirmed: 225 lux runs (45 x 5 conditions) + 42 original baseline runs = 267 total.")
+    else:
+        print(f"  ℹ Note: Found {len(entries)} runs (expected 267 if all 5 lux conditions [45 ea.] + 42 original are present).")
+    print("=" * 80 + "\n")
 
-    preds_dir = PROJECT_ROOT / cfg.get("outputs", {}).get("preds_dir", "results/preds")
-    preds_dir.mkdir(parents=True, exist_ok=True)
     summary_path = PROJECT_ROOT / cfg.get("outputs", {}).get("summary_csv", "results/ubfc_lowlight_conditions.csv")
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+    exclusions_path = PROJECT_ROOT / "results/exclusions.csv"
 
     # Resume support: check previously completed runs
     completed_keys = set()
@@ -264,8 +567,6 @@ def main():
         except Exception:
             pass
 
-    results = []
-
     for idx, item in enumerate(entries, start=1):
         cond = item["condition"]
         sid = item["subject_id"]
@@ -276,148 +577,99 @@ def main():
             print(f"[{idx}/{len(entries)}] Skipping already completed Condition='{cond}', Subject='{sid}'")
             continue
 
-        print(f"\n[{idx}/{len(entries)}] Processing Condition='{cond}', Subject='{sid}'...")
+        dup_flag = " [Duplicate Entry]" if item["is_duplicate"] else ""
+        print(f"\n[{idx}/{len(entries)}] Processing Condition='{cond}', Subject='{sid}'{dup_flag}...")
         print(f"  Video: {vid_p}")
 
-        # Load GT (returns ppg, hr, time)
-        ppg_gt, hr_gt, t_gt = load_ubfc_ground_truth(gt_p)
+        if args.no_subprocess:
+            # In-process execution mode
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_f:
+                tmp_json = Path(tmp_f.name)
+            try:
+                run_worker_task(
+                    condition=cond,
+                    subject_id=sid,
+                    video_path=vid_p,
+                    gt_path=gt_p,
+                    output_json=tmp_json,
+                    config_path=cfg_file,
+                    git_hash=git_hash,
+                )
+                with open(tmp_json, "r", encoding="utf-8") as f:
+                    row_dict = json.load(f)
+                tmp_json.unlink(missing_ok=True)
 
-        # Run FacePhys
-        bvp_u, t_u, meta = predict_bvp(
-            video_path=vid_p,
-            timestamps=t_gt,
-            fs_target=fs_u,
-            model_name="FacePhys.rlap",
-        )
+                df_row = pd.DataFrame([row_dict])
+                if not summary_path.is_file():
+                    df_row.to_csv(summary_path, index=False)
+                else:
+                    df_row.to_csv(summary_path, mode="a", header=False, index=False)
 
-        # Save prediction CSV
-        clean_cond = re.sub(r"[^\w\-]", "_", cond)
-        pred_csv = preds_dir / f"{clean_cond}_{sid}_facephys_pred.csv"
-        raw_bvp = meta.get("raw_bvp", bvp_u)
-        raw_ts = meta.get("raw_timestamps", None)
-        if raw_ts is None or len(raw_ts) != len(raw_bvp):
-            if len(t_gt) == len(raw_bvp):
-                raw_ts = t_gt
+                print(f"  Pred HR: {row_dict['video_hr_pred_bpm']:.2f} BPM | GT Primary: {row_dict['primary_ref_hr_bpm']:.2f} BPM | Error: {row_dict['video_error_vs_primary_bpm']:.2f} BPM")
+                print(f"  Window MAE: {row_dict['all_win_mae_vs_primary']:.2f} BPM | MedAE: {row_dict['all_win_medae_vs_primary']:.2f} BPM | Acc<=5BPM: {row_dict['all_win_acc5_vs_primary']:.1f}% | SNR: {row_dict['snr_primary_db']:.2f} dB")
+            except Exception as e:
+                err_text = traceback.format_exc()
+                print(f"  ERROR: In-process run failed for Condition='{cond}', Subject='{sid}': {e}")
+                log_exclusion(f"{cond}_{sid}", f"Execution failed: {str(e)}", exclusions_path)
+            continue
+
+        # Default isolated subprocess execution mode (memory-safe, prevents malloc corruption)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_f:
+            tmp_json = Path(tmp_f.name)
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--worker",
+            "--worker-condition", str(cond),
+            "--worker-subject-id", str(sid),
+            "--worker-video-path", str(vid_p),
+            "--worker-gt-path", str(gt_p),
+            "--worker-output-json", str(tmp_json),
+            "--config", str(args.config),
+        ]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and tmp_json.is_file():
+                with open(tmp_json, "r", encoding="utf-8") as f:
+                    row_dict = json.load(f)
+                tmp_json.unlink(missing_ok=True)
+
+                df_row = pd.DataFrame([row_dict])
+                if not summary_path.is_file():
+                    df_row.to_csv(summary_path, index=False)
+                else:
+                    df_row.to_csv(summary_path, mode="a", header=False, index=False)
+
+                print(f"  Pred HR: {row_dict['video_hr_pred_bpm']:.2f} BPM | GT Primary: {row_dict['primary_ref_hr_bpm']:.2f} BPM | Error: {row_dict['video_error_vs_primary_bpm']:.2f} BPM")
+                print(f"  Window MAE: {row_dict['all_win_mae_vs_primary']:.2f} BPM | MedAE: {row_dict['all_win_medae_vs_primary']:.2f} BPM | Acc<=5BPM: {row_dict['all_win_acc5_vs_primary']:.1f}% | SNR: {row_dict['snr_primary_db']:.2f} dB")
             else:
-                raw_ts = np.arange(len(raw_bvp)) / fs_u
+                err_msg = (proc.stderr or proc.stdout or "Unknown subprocess crash").strip()
+                print(f"  ERROR: Subprocess worker failed for Condition='{cond}', Subject='{sid}' (exit code {proc.returncode}):")
+                print(f"  {err_msg[-400:]}")
+                log_exclusion(
+                    subject_id=f"{cond}_{sid}",
+                    reason=f"Worker process failed (exit {proc.returncode}): {err_msg[-150:]}",
+                    exclusions_csv=exclusions_path,
+                )
+                tmp_json.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"  ERROR: Subprocess launch failed: {exc}")
+            log_exclusion(
+                subject_id=f"{cond}_{sid}",
+                reason=f"Subprocess launch exception: {exc}",
+                exclusions_csv=exclusions_path,
+            )
+            tmp_json.unlink(missing_ok=True)
 
-        min_len = min(len(raw_bvp), len(raw_ts))
-        df_pred = pd.DataFrame({
-            "frame_idx": np.arange(min_len),
-            "gt_timestamp_sec": np.asarray(raw_ts)[:min_len],
-            "facephys_bvp_raw": np.asarray(raw_bvp)[:min_len],
-        })
-        df_pred.to_csv(pred_csv, index=False)
-
-        # Uniform GT
-        _, ppg_u = resample_to_uniform(t_gt, ppg_gt, target_fs=fs_u)
-        _, hr_line_u = resample_to_uniform(t_gt, hr_gt, target_fs=fs_u, method="linear")
-
-        common_len = min(len(bvp_u), len(ppg_u), len(hr_line_u))
-        bvp_u = bvp_u[:common_len]
-        ppg_u = ppg_u[:common_len]
-        hr_line_u = hr_line_u[:common_len]
-
-        # Video-level HR
-        hr_pred_vid, f_pred, psd_pred = estimate_hr_welch(
-            butterworth_bandpass_filter(bvp_u, fs=fs_u, lowcut=lowcut, highcut=highcut, order=order),
-            fs=fs_u,
-            low_bpm=lowcut * 60.0,
-            high_bpm=highcut * 60.0,
-            nfft=16384,
-        )
-        primary_ref_hr = estimate_hr_video(ppg_u, fs=fs_u)
-        secondary_ref_hr = float(np.mean(hr_line_u))
-
-        # Spectral metrics
-        snr_prim = calculate_snr(psd_pred, f_pred, ref_hr_bpm=primary_ref_hr, delta_hz=snr_delta)
-        snr_sec = calculate_snr(psd_pred, f_pred, ref_hr_bpm=secondary_ref_hr, delta_hz=snr_delta)
-        peaks = get_top_spectral_peaks(psd_pred, f_pred, n_peaks=3)
-        lag_res = max_lag_waveform_correlation(bvp_u, ppg_u, fs=fs_u, max_lag_sec=max_lag)
-
-        # Windowed evaluation
-        _, hr_p_win = estimate_hr_windowed(bvp_u, fs=fs_u, window_sec=win_sec, stride_sec=stride_sec)
-        _, hr_prim_win = estimate_hr_windowed(ppg_u, fs=fs_u, window_sec=win_sec, stride_sec=stride_sec)
-
-        win_samp = int(round(win_sec * fs_u))
-        stride_samp = int(round(stride_sec * fs_u))
-        hr_sec_win = []
-        for st in range(0, len(hr_line_u) - win_samp + 1, stride_samp):
-            hr_sec_win.append(float(np.mean(hr_line_u[st:st + win_samp])))
-        hr_sec_win = np.array(hr_sec_win)
-
-        w_len = min(len(hr_p_win), len(hr_prim_win), len(hr_sec_win))
-        hr_p_sub = hr_p_win[:w_len]
-        hr_prim_sub = hr_prim_win[:w_len]
-        hr_sec_sub = hr_sec_win[:w_len]
-
-        # All windows
-        mae_all_prim = calc_mae(hr_prim_sub, hr_p_sub)
-        medae_all_prim = calc_medae(hr_prim_sub, hr_p_sub)
-        rmse_all_prim = calc_rmse(hr_prim_sub, hr_p_sub)
-        r_all_prim = calc_pearson_r(hr_prim_sub, hr_p_sub)
-        acc5_all_prim = calc_fraction_within_threshold(hr_prim_sub, hr_p_sub, threshold=thresh_bpm)
-
-        # Reliable windows (|Primary - Secondary| <= 5 BPM)
-        rel_mask = np.abs(hr_prim_sub - hr_sec_sub) <= thresh_bpm
-        n_rel = int(np.sum(rel_mask))
-
-        if n_rel > 0:
-            mae_rel_prim = calc_mae(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
-            medae_rel_prim = calc_medae(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
-            rmse_rel_prim = calc_rmse(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
-            r_rel_prim = calc_pearson_r(hr_prim_sub[rel_mask], hr_p_sub[rel_mask])
-            acc5_rel_prim = calc_fraction_within_threshold(hr_prim_sub[rel_mask], hr_p_sub[rel_mask], threshold=thresh_bpm)
-        else:
-            mae_rel_prim = medae_rel_prim = rmse_rel_prim = r_rel_prim = acc5_rel_prim = float("nan")
-
-        print(f"  Pred HR: {hr_pred_vid:.2f} BPM | GT Primary: {primary_ref_hr:.2f} BPM | Error: {abs(hr_pred_vid - primary_ref_hr):.2f} BPM")
-        print(f"  Window MAE: {mae_all_prim:.2f} BPM | MedAE: {medae_all_prim:.2f} BPM | Acc<=5BPM: {acc5_all_prim:.1f}% | SNR: {snr_prim:.2f} dB")
-
-        row_dict = {
-            "git_hash": git_hash,
-            "condition": cond,
-            "subject_id": sid,
-            "resolution": f"{meta.get('video_width', 'unknown')}x{meta.get('video_height', 'unknown')}",
-            "face_detected_ratio": meta.get("face_detected_ratio", 1.0),
-            "video_hr_pred_bpm": hr_pred_vid,
-            "primary_ref_hr_bpm": primary_ref_hr,
-            "secondary_ref_hr_bpm": secondary_ref_hr,
-            "video_error_vs_primary_bpm": abs(hr_pred_vid - primary_ref_hr),
-            "snr_primary_db": snr_prim,
-            "waveform_lag_max_r": lag_res["max_r"],
-            "waveform_optimal_lag_sec": lag_res["optimal_lag_sec"],
-            "peak1_bpm": peaks[0]["freq_bpm"] if len(peaks) > 0 else float("nan"),
-            "peak1_rel_power_inband": peaks[0]["rel_power_inband"] if len(peaks) > 0 else float("nan"),
-            "all_windows_count": w_len,
-            "all_win_mae_vs_primary": mae_all_prim,
-            "all_win_medae_vs_primary": medae_all_prim,
-            "all_win_rmse_vs_primary": rmse_all_prim,
-            "all_win_r_vs_primary": r_all_prim,
-            "all_win_acc5_vs_primary": acc5_all_prim,
-            "reliable_windows_count": n_rel,
-            "reliable_win_mae_vs_primary": mae_rel_prim,
-            "reliable_win_medae_vs_primary": medae_rel_prim,
-            "reliable_win_rmse_vs_primary": rmse_rel_prim,
-            "reliable_win_r_vs_primary": r_rel_prim,
-            "reliable_win_acc5_vs_primary": acc5_rel_prim,
-        }
-        results.append(row_dict)
-
-        # Incremental save per subject run
-        df_row = pd.DataFrame([row_dict])
-        if not summary_path.is_file():
-            df_row.to_csv(summary_path, index=False)
-        else:
-            df_row.to_csv(summary_path, mode="a", header=False, index=False)
-
+    # Print final cohort summaries
     if summary_path.is_file():
         df_out = pd.read_csv(summary_path)
         print("\n" + "=" * 80)
         print(f"Total evaluated runs in summary ({summary_path}): {len(df_out)}")
         print("=" * 80)
 
-        # Print Condition-Level Aggregates
         print("\nCondition-Level Summary (Mean across subjects in condition):")
         cond_summary = df_out.groupby("condition").agg({
             "video_error_vs_primary_bpm": ["mean", "median"],
@@ -434,4 +686,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
