@@ -154,6 +154,18 @@ class FacePhysWrapper:
 
         # Stream ingestion path: reads one frame at a time to keep RAM consumption <= 1 MB
         model = self._create_model()
+
+        # Force single-threaded pools on Linux to prevent glibc heap corruption.
+        # open-rppg creates ThreadPoolExecutor pools for face detection and resampling;
+        # concurrent pool workers trigger a thread-safety bug in glibc's allocator
+        # ("double free or corruption (!prev)" / "malloc(): invalid size") on large
+        # 640x480 rawvideo frames. Windows' allocator is unaffected.
+        import platform
+        if platform.system() == "Linux":
+            if hasattr(model, "face_detection_threads"):
+                model.face_detection_threads = 1
+            if hasattr(model, "face_resampling_threads"):
+                model.face_resampling_threads = 1
         width = 0
         height = 0
         total_frames = 0
@@ -293,6 +305,14 @@ class FacePhysWrapper:
             raise ValueError("No frames provided")
 
         model = self._create_model()
+
+        # Force single-threaded pools on Linux (see predict_video for rationale)
+        import platform
+        if platform.system() == "Linux":
+            if hasattr(model, "face_detection_threads"):
+                model.face_detection_threads = 1
+            if hasattr(model, "face_resampling_threads"):
+                model.face_resampling_threads = 1
 
         use_ts = False
         if timing_mode == "gt_timestamp" and timestamps is not None and len(timestamps) == n_frames:

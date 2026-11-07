@@ -726,6 +726,8 @@ def main():
         worker_env["NUMEXPR_NUM_THREADS"] = "1"
         worker_env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         worker_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.20"
+        # Limit glibc memory arenas to reduce thread contention on Linux
+        worker_env["MALLOC_ARENA_MAX"] = "2"
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, env=worker_env)
