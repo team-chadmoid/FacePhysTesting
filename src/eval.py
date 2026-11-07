@@ -17,9 +17,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy import interpolate
+from scipy import interpolate, signal as sp_signal
 
 from src.hr import (
+    butterworth_bandpass_filter,
     estimate_hr_from_bvp,
     estimate_hr_video,
     estimate_hr_windowed,
@@ -36,6 +37,30 @@ def calc_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if len(y_t) != len(y_p):
         raise ValueError(f"Length mismatch: len(y_true)={len(y_t)} != len(y_pred)={len(y_p)}")
     return float(np.mean(np.abs(y_p - y_t)))
+
+
+def calc_medae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Median Absolute Error (MedAE) in BPM."""
+    y_t = np.asarray(y_true, dtype=np.float64)
+    y_p = np.asarray(y_pred, dtype=np.float64)
+    if len(y_t) == 0 or len(y_p) == 0:
+        return float("nan")
+    if len(y_t) != len(y_p):
+        raise ValueError(f"Length mismatch: len(y_true)={len(y_t)} != len(y_pred)={len(y_p)}")
+    return float(np.median(np.abs(y_p - y_t)))
+
+
+def calc_fraction_within_threshold(
+    y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 5.0
+) -> float:
+    """Percentage of estimates within threshold (default: 5.0 BPM)."""
+    y_t = np.asarray(y_true, dtype=np.float64)
+    y_p = np.asarray(y_pred, dtype=np.float64)
+    if len(y_t) == 0 or len(y_p) == 0:
+        return float("nan")
+    if len(y_t) != len(y_p):
+        raise ValueError(f"Length mismatch: len(y_true)={len(y_t)} != len(y_pred)={len(y_p)}")
+    return float(np.mean(np.abs(y_p - y_t) <= threshold) * 100.0)
 
 
 def calc_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -103,16 +128,20 @@ def calc_bland_altman(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float
 
 
 def calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute complete metric suite: MAE, RMSE, Pearson r, Bland-Altman."""
+    """Compute complete metric suite: MAE, MedAE, RMSE, Pearson r, Fraction <= 5 BPM, Bland-Altman."""
     mae = calc_mae(y_true, y_pred)
+    medae = calc_medae(y_true, y_pred)
     rmse = calc_rmse(y_true, y_pred)
     r = calc_pearson_r(y_true, y_pred)
+    frac_5bpm = calc_fraction_within_threshold(y_true, y_pred, threshold=5.0)
     ba = calc_bland_altman(y_true, y_pred)
 
     return {
         "mae": mae,
+        "medae": medae,
         "rmse": rmse,
         "pearson_r": r,
+        "fraction_within_5bpm": frac_5bpm,
         "bias": ba["bias"],
         "std": ba["std"],
         "upper_loa": ba["upper_loa"],
@@ -333,4 +362,188 @@ def log_exclusion(
     else:
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
+
+
+def calculate_snr(
+    psd: np.ndarray,
+    freqs: np.ndarray,
+    ref_hr_bpm: float,
+    delta_hz: float = 0.1,
+    harmonic: bool = True,
+    band: Tuple[float, float] = (0.7, 3.0),
+) -> float:
+    """Calculate Signal-to-Noise Ratio (SNR) in dB around reference HR frequency.
+
+    Signal power is integrated in [f0 - delta_hz, f0 + delta_hz] and optionally
+    [2*f0 - 2*delta_hz, 2*f0 + 2*delta_hz] (if <= band[1]).
+    Noise power is the integrated power across the remainder of the band [0.7, 3.0] Hz.
+
+    Args:
+        psd: Power spectral density array.
+        freqs: Frequency array in Hz.
+        ref_hr_bpm: Reference heart rate in BPM.
+        delta_hz: Half-width around fundamental in Hz (default: 0.1 Hz ~ 6 BPM).
+        harmonic: Whether to include the first harmonic 2*f0 (default: True).
+        band: In-band search range in Hz (default: (0.7, 3.0)).
+
+    Returns:
+        SNR in dB: 10 * log10(P_signal / P_noise).
+    """
+    low_hz, high_hz = band
+    in_band = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(in_band):
+        return float("nan")
+
+    f0 = ref_hr_bpm / 60.0
+    sig_mask = np.abs(freqs - f0) <= delta_hz
+    if harmonic:
+        f1 = 2.0 * f0
+        if f1 <= high_hz:
+            sig_mask = sig_mask | (np.abs(freqs - f1) <= 2.0 * delta_hz)
+
+    signal_bins = in_band & sig_mask
+    noise_bins = in_band & (~sig_mask)
+
+    p_sig = float(np.sum(psd[signal_bins]))
+    p_noise = float(np.sum(psd[noise_bins]))
+
+    if p_sig <= 0.0:
+        return -50.0
+    if p_noise <= 0.0:
+        return 50.0
+
+    return float(10.0 * np.log10(p_sig / p_noise))
+
+
+def get_top_spectral_peaks(
+    psd: np.ndarray,
+    freqs: np.ndarray,
+    n_peaks: int = 3,
+    band: Tuple[float, float] = (0.7, 3.0),
+) -> List[Dict[str, float]]:
+    """Extract top-N spectral peaks within frequency band with relative power.
+
+    Args:
+        psd: Power spectral density array.
+        freqs: Frequency array in Hz.
+        n_peaks: Number of peaks to retrieve (default: 3).
+        band: Frequency range in Hz (default: (0.7, 3.0)).
+
+    Returns:
+        List of dicts sorted by power descending, each containing:
+            - rank: 1-based rank
+            - freq_hz: peak frequency in Hz
+            - freq_bpm: peak frequency in BPM
+            - power: absolute PSD power at peak
+            - rel_power_inband: power / total_inband_psd
+            - rel_power_max: power / max_peak_power
+    """
+    low_hz, high_hz = band
+    in_band = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(in_band):
+        return []
+
+    f_sub = freqs[in_band]
+    p_sub = psd[in_band]
+    total_inband_power = float(np.sum(p_sub))
+
+    peaks, _ = sp_signal.find_peaks(p_sub)
+    if len(peaks) == 0:
+        peaks = np.array([np.argmax(p_sub)])
+
+    sorted_peak_indices = peaks[np.argsort(p_sub[peaks])[::-1]]
+    top_indices = sorted_peak_indices[:n_peaks]
+
+    max_p = float(p_sub[top_indices[0]]) if len(top_indices) > 0 else 1.0
+
+    results = []
+    for rank, idx in enumerate(top_indices, start=1):
+        p_val = float(p_sub[idx])
+        f_val = float(f_sub[idx])
+        rel_inband = float(p_val / total_inband_power) if total_inband_power > 0 else 0.0
+        rel_max = float(p_val / max_p) if max_p > 0 else 0.0
+        results.append({
+            "rank": rank,
+            "freq_hz": f_val,
+            "freq_bpm": f_val * 60.0,
+            "power": p_val,
+            "rel_power_inband": rel_inband,
+            "rel_power_max": rel_max,
+        })
+
+    return results
+
+
+def max_lag_waveform_correlation(
+    pred_bvp: np.ndarray,
+    ref_bvp: np.ndarray,
+    fs: float = 30.0,
+    max_lag_sec: float = 2.0,
+    band: Optional[Tuple[float, float]] = (0.7, 3.0),
+) -> Dict[str, float]:
+    """Calculate cross-correlation between predicted BVP and GT PPG across lags.
+
+    Args:
+        pred_bvp: Predicted BVP signal (1D).
+        ref_bvp: Reference PPG/BVP signal (1D).
+        fs: Sampling rate in Hz (default: 30.0).
+        max_lag_sec: Maximum time lag to search in seconds (default: 2.0 s).
+        band: Optional bandpass filtering range in Hz (default: (0.7, 3.0)).
+
+    Returns:
+        Dict with keys:
+            - max_r: maximum positive Pearson r across lags
+            - optimal_lag_sec: optimal lag tau in seconds (pred shifted by tau)
+            - optimal_lag_frames: optimal lag in integer frames
+            - max_abs_r: maximum absolute Pearson |r| across lags
+            - abs_optimal_lag_sec: lag at maximum absolute correlation
+    """
+    p = np.asarray(pred_bvp, dtype=np.float64)
+    r = np.asarray(ref_bvp, dtype=np.float64)
+
+    min_len = min(len(p), len(r))
+    if min_len < int(round(fs * 2.0)):
+        return {
+            "max_r": 0.0,
+            "optimal_lag_sec": 0.0,
+            "optimal_lag_frames": 0,
+            "max_abs_r": 0.0,
+            "abs_optimal_lag_sec": 0.0,
+        }
+
+    p = p[:min_len]
+    r = r[:min_len]
+
+    if band is not None:
+        p = butterworth_bandpass_filter(p, fs=fs, lowcut=band[0], highcut=band[1], order=3)
+        r = butterworth_bandpass_filter(r, fs=fs, lowcut=band[0], highcut=band[1], order=3)
+
+    max_k = int(round(max_lag_sec * fs))
+    lags = np.arange(-max_k, max_k + 1)
+    corrs = []
+
+    for k in lags:
+        if k > 0:
+            p_slice = p[k:]
+            r_slice = r[:-k]
+        elif k < 0:
+            p_slice = p[:k]
+            r_slice = r[-k:]
+        else:
+            p_slice = p
+            r_slice = r
+        corr = calc_pearson_r(r_slice, p_slice)
+        corrs.append(corr)
+
+    corrs = np.array(corrs)
+    best_pos_idx = np.argmax(corrs)
+    best_abs_idx = np.argmax(np.abs(corrs))
+
+    return {
+        "max_r": float(corrs[best_pos_idx]),
+        "optimal_lag_sec": float(lags[best_pos_idx] / fs),
+        "optimal_lag_frames": int(lags[best_pos_idx]),
+        "max_abs_r": float(corrs[best_abs_idx]),
+        "abs_optimal_lag_sec": float(lags[best_abs_idx] / fs),
+    }
 

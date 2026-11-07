@@ -10,10 +10,15 @@ import pytest
 
 from src.eval import (
     calc_mae,
+    calc_medae,
+    calc_fraction_within_threshold,
     calc_rmse,
     calc_pearson_r,
     calc_bland_altman,
     calc_metrics,
+    calculate_snr,
+    get_top_spectral_peaks,
+    max_lag_waveform_correlation,
     evaluate_ground_truth_consistency,
     log_exclusion,
     plot_bland_altman,
@@ -125,5 +130,89 @@ def test_plot_bland_altman_across_subjects():
         )
         assert save_path.is_file()
         assert save_path.stat().st_size > 0
+
+
+def test_medae_and_fraction_within_threshold():
+    y_true = np.array([60.0, 70.0, 80.0, 90.0, 100.0])
+    # Diffs: [1.0, 4.0, 6.0, 2.0, 10.0] -> sorted: [1.0, 2.0, 4.0, 6.0, 10.0] -> median is 4.0
+    y_pred = np.array([61.0, 74.0, 86.0, 92.0, 110.0])
+
+    medae = calc_medae(y_true, y_pred)
+    assert np.isclose(medae, 4.0)
+
+    # Within 5.0 BPM: 1.0, 4.0, 2.0 (3 out of 5 = 60.0%)
+    frac = calc_fraction_within_threshold(y_true, y_pred, threshold=5.0)
+    assert np.isclose(frac, 60.0)
+
+    # Check calc_metrics returns them
+    metrics = calc_metrics(y_true, y_pred)
+    assert "medae" in metrics
+    assert "fraction_within_5bpm" in metrics
+    assert np.isclose(metrics["medae"], 4.0)
+    assert np.isclose(metrics["fraction_within_5bpm"], 60.0)
+
+
+def test_calculate_snr_synthetic():
+    fs = 30.0
+    t = np.arange(0, 30.0, 1.0 / fs)
+    target_bpm = 90.0  # 1.5 Hz
+    f0 = target_bpm / 60.0
+
+    # Clean signal + weak white noise
+    sig = np.sin(2 * np.pi * f0 * t) + 0.1 * np.sin(2 * np.pi * (2 * f0) * t)
+    noise = 0.05 * np.cos(2 * np.pi * 0.8 * t)
+
+    from scipy import signal as sp_signal
+    f, psd = sp_signal.welch(sig + noise, fs=fs, nperseg=int(fs * 30), nfft=8192)
+
+    snr = calculate_snr(psd, f, ref_hr_bpm=target_bpm, delta_hz=0.1, harmonic=True)
+    # With clean dominant sinusoid, SNR should be positive and high (> 10 dB)
+    assert snr > 10.0
+
+    # With completely uncorrelated frequency reference (e.g. 50 BPM when pulse is at 90 BPM)
+    snr_wrong = calculate_snr(psd, f, ref_hr_bpm=50.0, delta_hz=0.05, harmonic=False)
+    assert snr_wrong < 0.0
+
+
+def test_top_spectral_peaks_synthetic():
+    fs = 30.0
+    t = np.arange(0, 30.0, 1.0 / fs)
+    # Three frequencies: 72 BPM (1.2 Hz, large), 120 BPM (2.0 Hz, medium), 90 BPM (1.5 Hz, small)
+    sig = (
+        1.0 * np.sin(2 * np.pi * 1.2 * t)
+        + 0.5 * np.sin(2 * np.pi * 2.0 * t)
+        + 0.25 * np.sin(2 * np.pi * 1.5 * t)
+    )
+
+    from scipy import signal as sp_signal
+    f, psd = sp_signal.welch(sig, fs=fs, nperseg=int(fs * 30), nfft=8192)
+
+    peaks = get_top_spectral_peaks(psd, f, n_peaks=3)
+    assert len(peaks) == 3
+    # Top peak should be near 72 BPM
+    assert np.isclose(peaks[0]["freq_bpm"], 72.0, atol=1.0)
+    # Second peak should be near 120 BPM
+    assert np.isclose(peaks[1]["freq_bpm"], 120.0, atol=1.0)
+    # Third peak should be near 90 BPM
+    assert np.isclose(peaks[2]["freq_bpm"], 90.0, atol=1.0)
+    assert peaks[0]["rel_power_max"] == 1.0
+    assert peaks[1]["rel_power_max"] < 1.0
+
+
+def test_max_lag_waveform_correlation_synthetic():
+    fs = 30.0
+    t = np.arange(0, 30.0, 1.0 / fs)
+    # Sinusoid at 1.0 Hz (60 BPM)
+    sig1 = np.sin(2 * np.pi * 1.0 * t)
+    # Shifted by 6 samples (0.2 s)
+    shift_samples = 6
+    sig2 = np.sin(2 * np.pi * 1.0 * (t - shift_samples / fs))
+
+    res = max_lag_waveform_correlation(sig2, sig1, fs=fs, max_lag_sec=1.0)
+    # Optimal lag should match the planted shift
+    assert abs(res["optimal_lag_frames"] - shift_samples) <= 1
+    assert abs(res["optimal_lag_sec"] - 0.2) <= 0.05
+    assert res["max_r"] > 0.99
+
 
 

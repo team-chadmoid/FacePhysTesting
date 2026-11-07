@@ -82,6 +82,37 @@ class FacePhysWrapper:
         if n_frames == 0:
             raise ValueError(f"No frames could be read from video {path}")
 
+        bvp_uniform, t_uniform, metadata = self.predict_from_frames(
+            frames=frames, timestamps=timestamps, fs_target=fs_target
+        )
+        metadata.update({
+            "video_path": str(path),
+            "video_width": width,
+            "video_height": height,
+            "total_frames": total_frames,
+        })
+        return bvp_uniform, t_uniform, metadata
+
+    def predict_from_frames(
+        self,
+        frames: List[np.ndarray],
+        timestamps: Optional[np.ndarray] = None,
+        fs_target: float = 30.0,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Predict BVP waveform directly from an in-memory list of RGB frames.
+
+        Args:
+            frames: List of 2D/3D uint8 RGB images.
+            timestamps: Optional 1D array of GT timestamps in seconds (length = len(frames)).
+            fs_target: Target uniform sampling rate in Hz (default: 30.0).
+
+        Returns:
+            Tuple of (bvp_uniform, t_uniform, metadata).
+        """
+        n_frames = len(frames)
+        if n_frames == 0:
+            raise ValueError("No frames provided")
+
         model = self._get_model()
 
         # Stream frames through model
@@ -95,15 +126,12 @@ class FacePhysWrapper:
 
         # Retrieve face detection diagnostics from model
         stats = dict(getattr(model, "statistic", {}))
-        hasface_val = getattr(model, "hasface", 0.0)
         null_count = stats.get("null", 0)
         detected_frames = n_frames - null_count
         face_detect_ratio = float(detected_frames / n_frames) if n_frames > 0 else 0.0
 
         # Alignment and uniform resampling:
-        # If lengths differ slightly due to warmup/padding, handle gracefully
         if len(bvp_raw) != n_frames:
-            # If bvp_raw has fewer or more samples, pad or truncate to match frames exactly
             if len(bvp_raw) < n_frames:
                 pad = np.full(n_frames - len(bvp_raw), bvp_raw[-1] if len(bvp_raw) > 0 else 0.0)
                 bvp_raw = np.concatenate([bvp_raw, pad])
@@ -113,20 +141,14 @@ class FacePhysWrapper:
         if timestamps is not None:
             t_orig = np.asarray(timestamps, dtype=np.float64)
             if len(t_orig) != n_frames:
-                # If mismatch between GT timestamps and frames, interpolate timestamps to frame count
                 t_orig = np.linspace(t_orig[0], t_orig[-1], n_frames)
         else:
             t_orig = np.arange(n_frames) / fs_target
 
-        # Map frame i -> timestamp i, then resample both to uniform grid
         t_uniform, bvp_uniform = resample_to_uniform(t_orig, bvp_raw, target_fs=fs_target)
 
         metadata = {
             "model_name": self.model_name,
-            "video_path": str(path),
-            "video_width": width,
-            "video_height": height,
-            "total_frames": total_frames,
             "decoded_frames": n_frames,
             "bvp_raw_length": len(bvp_raw),
             "face_detected_ratio": face_detect_ratio,
@@ -158,3 +180,4 @@ def predict_bvp(
     """
     wrapper = FacePhysWrapper(model_name=model_name)
     return wrapper.predict_video(video_path, timestamps=timestamps, fs_target=fs_target)
+

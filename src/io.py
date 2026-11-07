@@ -234,24 +234,27 @@ def resample_to_uniform(
     Returns:
         Tuple of (uniform_time, uniform_signal).
     """
-    if len(time) != len(signal):
+    time_arr = np.asarray(time, dtype=np.float64)
+    sig_arr = np.asarray(signal, dtype=np.float64)
+
+    if len(time_arr) != len(sig_arr):
         raise ValueError("time and signal must have identical lengths")
-    if len(time) < 4:
+    if len(time_arr) < 4:
         raise ValueError("time series too short to resample")
 
     # Deduplicate non-strictly-increasing timestamps
-    diffs = np.diff(time)
+    diffs = np.diff(time_arr)
     non_pos = np.where(diffs <= 0)[0]
     if len(non_pos) > 0:
         # Keep strictly increasing timestamps
-        keep = np.ones(len(time), dtype=bool)
+        keep = np.ones(len(time_arr), dtype=bool)
         for idx in non_pos:
             keep[idx + 1] = False
-        t_clean = time[keep]
-        s_clean = signal[keep]
+        t_clean = time_arr[keep]
+        s_clean = sig_arr[keep]
     else:
-        t_clean = time
-        s_clean = signal
+        t_clean = time_arr
+        s_clean = sig_arr
 
     dt_target = 1.0 / target_fs
     n_steps = int(round((t_clean[-1] - t_clean[0]) * target_fs)) + 1

@@ -1,0 +1,41 @@
+# Configuration for FacePhys Cross-Check and Subject4 Diagnostics
+experiment_name: "facephys_crosscheck_and_diagnostics"
+seed: 42
+
+dataset:
+  name: "UBFC-RPPG Dataset 2"
+  root_dir: "data/ubfc/Data Set 2"
+  subjects:
+    - "subject1"
+    - "subject3"
+    - "subject4"
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  welch:
+    nperseg_sec: 30.0
+    nfft_window: 8192
+    nfft_video: 16384
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+subject4_experiments:
+  upscale_resolution: [640, 480]
+  pad_border_pixels: 60
+
+metrics:
+  lag_search_max_sec: 2.0
+  snr_delta_hz: 0.1
+  threshold_bpm: 5.0
+
+outputs:
+  crosscheck_csv: "results/crosscheck_process_video.csv"
+  subject4_experiments_csv: "results/subject4_spatial_experiments.csv"
+  spectrum_window_metrics_csv: "results/spectrum_and_window_metrics.csv"
+  subject4_spectra_plot: "results/plots/subject4_spectra_comparison.png"
+
