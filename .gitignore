@@ -18,4 +18,5 @@ data/
 .env
 venv/
 .venv/
+.cache/
 

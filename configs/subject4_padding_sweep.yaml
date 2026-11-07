@@ -1,0 +1,39 @@
+# Configuration for Subject 4 Padding Sweep (0, 30, 60, 90 px)
+experiment_name: subject4_padding_sweep
+description: >
+  Controlled padding sweep on subject4 (native tight crop 242x242).
+  Evaluates 0, 30, 60, and 90 px symmetric cv2.BORDER_REFLECT padding
+  under frozen baseline-v1 settings (Path 3 GT-timestamp, synchronous=True).
+  NOTE: Per evaluation protocol, do not adopt a padding size based on this one subject.
+
+dataset:
+  root_dir: "data/ubfc/Data Set 2"
+  subject: "subject4"
+
+padding_sweep:
+  padding_sizes_px: [0, 30, 60, 90]
+  border_mode: "reflect"
+  policy_note: "Do not adopt a padding size based on this one subject."
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 0.5   # Strictly limited to +/- 0.5s per protocol
+  snr_delta_hz: 0.1
+
+preregistered_baseline:
+  timing_mode: "gt_timestamp"
+  synchronous: true
+
+outputs:
+  results_csv: "results/subject4_padding_sweep.csv"
+

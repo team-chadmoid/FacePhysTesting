@@ -1,0 +1,18 @@
+# IEEE SP Cup 2027 (FaceVitals) - Pinned Dependencies
+# Verified bit-exact deterministic reproduction under Python 3.12 (Miniconda / Windows 11)
+open-rppg==0.1.1
+onnxruntime==1.31.1
+opencv-python==5.0.0.93
+numpy==2.3.3
+scipy==1.18.1
+pandas==3.1.1
+matplotlib==3.11.2
+PyYAML==6.0.3
+pytest==9.1.1
+av==19.0.2
+heartpy==1.2.7
+pillow==11.3.0
+tqdm==4.67.1
+h5py==3.16.0
+pydantic==2.11.7
+

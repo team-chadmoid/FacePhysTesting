@@ -1,0 +1,2 @@
+cohort_size,video_mae_bpm,video_medae_bpm,video_rmse_bpm,video_pearson_r,bland_altman_mean_bias_bpm,bland_altman_lower_loa_bpm,bland_altman_upper_loa_bpm,pct_subjects_waveform_r_ge_07,median_snr_db,gate_passed_medae_le_2bpm,gate_passed_pct_r_ge_07
+7,1.9147600446428572,0.2197265625,4.615005121244474,0.9105910361781614,-1.7578125,-10.791498086778063,7.275873086778063,85.71428571428571,2.1617149238734177,True,True
