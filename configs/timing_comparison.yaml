@@ -1,0 +1,40 @@
+# Configuration for Phase A: Timing & 3-Path Comparison
+experiment_name: timing_3path_comparison
+description: >
+  Controlled comparison of three timing paths on identical video frames:
+  1) Library default: PyAV container timestamps
+  2) Uniform-synthetic: ts = i / 30.0
+  3) GT-timestamp (pre-registered baseline-of-record): ts = t_gt[i]
+  All resampled onto the exact same uniform GT timeline with equal lengths.
+
+dataset:
+  root_dir: "data/ubfc/Data Set 2"
+  subjects:
+    - subject1
+    - subject3
+    - subject4
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 2.0
+  snr_delta_hz: 0.1
+
+preregistered_baseline:
+  timing_mode: "gt_timestamp"
+  notes: "GT-timestamp path feeds camera hardware capture timestamps directly to update_frame."
+
+outputs:
+  results_csv: "results/timing_comparison.csv"
+  crosscheck_csv: "results/crosscheck_3paths.csv"
+  plot_dir: "results/plots/timing_comparison"
+

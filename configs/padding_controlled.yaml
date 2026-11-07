@@ -1,0 +1,42 @@
+# Configuration for Phase B: Controlled Face-Crop & Border Padding Test
+experiment_name: padding_controlled_test
+description: >
+  Controlled test of face crop tight borders vs border padding on identical frames.
+  For 640x480 subjects (subject1, subject3), crops tightly to the face box (0px margin)
+  and compares unpadded vs padded (+60px margin) and full frame.
+  For subject4 (native tight crop 242x242), compares unpadded vs padded (+60px margin).
+  All runs use the pre-registered baseline (Path 3: GT-timestamp).
+
+dataset:
+  root_dir: "data/ubfc/Data Set 2"
+  subjects:
+    - subject1
+    - subject3
+    - subject4
+
+padding_rule:
+  fixed_border_px: 60
+  border_mode: "reflect"
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 2.0
+  snr_delta_hz: 0.1
+
+preregistered_baseline:
+  timing_mode: "gt_timestamp"
+
+outputs:
+  results_csv: "results/padding_controlled_test.csv"
+  plot_dir: "results/plots/padding_controlled"
+
