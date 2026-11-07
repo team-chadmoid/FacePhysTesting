@@ -1,0 +1,55 @@
+# Configuration for Phase C: Pilot Evaluation on Next 4 Subjects (Frozen Baseline-v1)
+experiment_name: pilot_4_subjects
+description: >
+  Pilot run on the next 4 available subjects in sequential numerical ID order (subject5, subject8, subject9, subject10).
+  Settings frozen from Phase A (GT-timestamp timing baseline) and Phase B (padding hypothesis rule).
+  Gate check:
+    1) Median video-level error <= 2.0 BPM
+    2) At least 70% of subjects with waveform r >= 0.7 (lag search +/- 0.5s)
+  No cherry-picking, no parameter tuning per subject, all subjects reported including failures.
+
+dataset:
+  root_dir: "data/ubfc/Data Set 2"
+  fallback_dir: "/content/drive/MyDrive/DATASET_2"
+  exclude_exploration_subjects:
+    - subject1
+    - subject3
+    - subject4
+  pilot_subject_count: 4
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+padding_rule_hypothesis:
+  origin: "Hypothesis derived from single natively tight subject (subject4)"
+  description: >
+    FacePhys degradation under edge-to-edge face framing (<350px) is mitigated by
+    symmetric reflect border padding. Uncropped full-frame videos (>=350px) retain
+    natural background margin and do not receive padding.
+  fixed_border_px: 60
+  border_mode: "reflect"
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 0.5   # Limited to +/- 0.5s physiological window per protocol
+  snr_delta_hz: 0.1
+
+preregistered_baseline:
+  timing_mode: "gt_timestamp"
+  synchronous: true
+
+gate:
+  max_median_video_error_bpm: 2.0
+  min_pct_waveform_r_above_07: 70.0
+
+outputs:
+  results_csv: "results/pilot_4_subjects.csv"
+  plot_dir: "results/plots/pilot_4_subjects"
+

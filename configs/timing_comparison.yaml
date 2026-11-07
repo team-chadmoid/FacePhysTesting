@@ -1,4 +1,4 @@
-# Configuration for Phase A: Timing & 3-Path Comparison
+# Configuration for Phase A: Timing & 3-Path Comparison (Frozen Baseline-v1)
 experiment_name: timing_3path_comparison
 description: >
   Controlled comparison of three timing paths on identical video frames:
@@ -6,6 +6,7 @@ description: >
   2) Uniform-synthetic: ts = i / 30.0
   3) GT-timestamp (pre-registered baseline-of-record): ts = t_gt[i]
   All resampled onto the exact same uniform GT timeline with equal lengths.
+  Frame feeding is strictly synchronous to ensure 100% determinism.
 
 dataset:
   root_dir: "data/ubfc/Data Set 2"
@@ -26,15 +27,15 @@ preprocessing:
 
 metrics:
   threshold_bpm: 5.0
-  lag_search_max_sec: 2.0
+  lag_search_max_sec: 0.5   # Limited to +/- 0.5s physiological window per protocol
   snr_delta_hz: 0.1
 
 preregistered_baseline:
   timing_mode: "gt_timestamp"
-  notes: "GT-timestamp path feeds camera hardware capture timestamps directly to update_frame."
+  synchronous: true
+  notes: "Feeds camera hardware capture timestamps directly to update_frame with synchronous barrier."
 
 outputs:
   results_csv: "results/timing_comparison.csv"
   crosscheck_csv: "results/crosscheck_3paths.csv"
   plot_dir: "results/plots/timing_comparison"
-

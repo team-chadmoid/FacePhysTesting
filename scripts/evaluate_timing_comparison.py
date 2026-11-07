@@ -264,6 +264,9 @@ def main():
             results_rows.append({
                 "git_hash": git_hash,
                 "subject_id": sid,
+                "video_path": str(vid_path),
+                "video_size_bytes": os.path.getsize(str(vid_path)),
+                "video_size_mb": round(os.path.getsize(str(vid_path)) / (1024.0 * 1024.0), 2),
                 "resolution": res_str,
                 "timing_path": pname,
                 "is_preregistered_baseline": (pname == "path3_gt_timestamp_baseline"),

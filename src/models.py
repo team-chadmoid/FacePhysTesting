@@ -64,6 +64,7 @@ class FacePhysWrapper:
         video_path: Union[str, Path],
         timestamps: Optional[np.ndarray] = None,
         timing_mode: str = "gt_timestamp",
+        synchronous: bool = True,
         fs_target: float = 30.0,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """Predict BVP waveform from video file.
@@ -75,6 +76,8 @@ class FacePhysWrapper:
                 - 'gt_timestamp': Feed GT capture timestamps to update_frame (baseline of record).
                 - 'uniform': Feed synthetic uniform timestamps (i / fs_target).
                 - 'container': Feed container PTS timestamps decoded via PyAV.
+            synchronous: If True, waits for each frame's face detection and preprocessing
+                task to complete before submitting the next frame, ensuring 100% determinism.
             fs_target: Target uniform sampling rate in Hz (default: 30.0).
 
         Returns:
@@ -148,6 +151,7 @@ class FacePhysWrapper:
             frames=frames,
             timestamps=feed_ts,
             timing_mode=timing_mode,
+            synchronous=synchronous,
             fs_target=fs_target,
         )
         metadata.update({
@@ -156,6 +160,7 @@ class FacePhysWrapper:
             "video_height": height,
             "total_frames": total_frames,
             "timing_mode": timing_mode,
+            "synchronous": synchronous,
         })
         return bvp_uniform, t_uniform, metadata
 
@@ -164,6 +169,7 @@ class FacePhysWrapper:
         frames: List[np.ndarray],
         timestamps: Optional[np.ndarray] = None,
         timing_mode: str = "gt_timestamp",
+        synchronous: bool = True,
         fs_target: float = 30.0,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """Predict BVP waveform directly from an in-memory list of RGB frames.
@@ -172,6 +178,7 @@ class FacePhysWrapper:
             frames: List of 2D/3D uint8 RGB images.
             timestamps: Optional 1D array of capture timestamps in seconds.
             timing_mode: 'gt_timestamp' (pre-registered baseline of record), 'uniform', or 'container'.
+            synchronous: If True, waits for face detection future per frame for 100% deterministic runs.
             fs_target: Target uniform sampling rate in Hz (default: 30.0).
 
         Returns:
@@ -202,6 +209,9 @@ class FacePhysWrapper:
                     model.update_frame(frame, float(ts_to_feed[idx]))
                 else:
                     model.update_frame(frame, float(idx / fs_target))
+                # Synchronous feeding: block on background worker thread for this frame
+                if synchronous and model.face_detection_task is not None:
+                    model.face_detection_task.result()
 
         bvp_raw, ts_raw = model.bvp(raw=True)
         bvp_raw = np.asarray(bvp_raw, dtype=np.float64)
@@ -249,6 +259,7 @@ def predict_bvp(
     video_path: Union[str, Path],
     timestamps: Optional[np.ndarray] = None,
     timing_mode: str = "gt_timestamp",
+    synchronous: bool = True,
     fs_target: float = 30.0,
     model_name: str = "FacePhys.rlap",
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
@@ -258,6 +269,7 @@ def predict_bvp(
         video_path: Path to video file.
         timestamps: Optional GT timestamps array (seconds).
         timing_mode: Timing mode ('gt_timestamp', 'uniform', or 'container').
+        synchronous: If True, waits for face detection per frame for deterministic execution.
         fs_target: Target uniform sampling rate in Hz (default: 30.0).
         model_name: Model identifier (default: 'FacePhys.rlap').
 
@@ -266,6 +278,10 @@ def predict_bvp(
     """
     wrapper = FacePhysWrapper(model_name=model_name)
     return wrapper.predict_video(
-        video_path, timestamps=timestamps, timing_mode=timing_mode, fs_target=fs_target
+        video_path,
+        timestamps=timestamps,
+        timing_mode=timing_mode,
+        synchronous=synchronous,
+        fs_target=fs_target,
     )
 

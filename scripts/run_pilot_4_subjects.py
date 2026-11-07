@@ -1,11 +1,12 @@
-"""Phase C: Pilot Evaluation on Next 7 Subjects in Sequential ID Order.
+"""Phase C: Pilot Evaluation on Next 4 Subjects in Sequential ID Order.
 
-Runs frozen baseline pipeline (GT-timestamp timing + verified spatial settings)
-on the next 7 subjects in sequential numerical ID order without cherry-picking.
+Runs frozen baseline pipeline (GT-timestamp timing + synchronous feeding + verified spatial settings)
+on the next 4 subjects in sequential numerical ID order (subject5, subject8, subject9, subject10)
+without cherry-picking.
 
 Evaluation Gate:
 - Median video-level error <= 2.0 BPM
-- At least 70% of subjects with waveform r >= 0.7
+- At least 70% of subjects with waveform r >= 0.7 (lag search +/- 0.5s)
 """
 
 import argparse
@@ -65,20 +66,22 @@ def extract_subject_number(subject_id: str) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase C Pilot Evaluation")
+    parser = argparse.ArgumentParser(description="Phase C Pilot Evaluation (4 Subjects)")
     parser.add_argument("--data-dir", type=str, default=None, help="Root dataset directory")
     parser.add_argument("--subjects", nargs="+", default=None, help="Explicit list of subjects")
-    parser.add_argument("--count", type=int, default=7, help="Number of pilot subjects to evaluate")
+    parser.add_argument("--count", type=int, default=4, help="Number of pilot subjects to evaluate (default: 4)")
     args = parser.parse_args()
 
     git_hash = get_git_hash()
     print("=" * 80)
-    print("=== Phase C: Pilot Evaluation on Next Sequential Subjects ===")
+    print("=== Phase C: Pilot Evaluation on Next Sequential Subjects (4 Subjects) ===")
     print(f"Git commit hash: {git_hash}")
     print("Pre-registered Baseline of Record: GT-timestamp path (timing_mode='gt_timestamp')")
+    print("Synchronous worker execution: ENABLED (100% deterministic)")
+    print("Lag search window: +/- 0.5 s")
     print("=" * 80)
 
-    config_path = PROJECT_ROOT / "configs" / "pilot_7_subjects.yaml"
+    config_path = PROJECT_ROOT / "configs" / "pilot_4_subjects.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -107,7 +110,7 @@ def main():
             [sid for sid in subjects_map.keys() if sid not in excluded],
             key=extract_subject_number,
         )
-        target_count = args.count if args.count else int(cfg.get("dataset", {}).get("pilot_subject_count", 7))
+        target_count = args.count if args.count else int(cfg.get("dataset", {}).get("pilot_subject_count", 4))
         pilot_subject_ids = all_sids[:target_count]
 
     print(f"Discovered subjects in numerical ID order (excluding exploration set {list(excluded) if not args.subjects else []}):")
@@ -123,8 +126,9 @@ def main():
     order = int(cfg.get("preprocessing", {}).get("bandpass", {}).get("order", 3))
     win_sec = float(cfg.get("preprocessing", {}).get("windowing", {}).get("window_sec", 30.0))
     stride_sec = float(cfg.get("preprocessing", {}).get("windowing", {}).get("stride_sec", 1.0))
-    threshold_bpm = 5.0
-    pad_px = int(cfg.get("padding_rule", {}).get("fixed_border_px", 60))
+    threshold_bpm = float(cfg.get("metrics", {}).get("threshold_bpm", 5.0))
+    max_lag_sec = float(cfg.get("metrics", {}).get("lag_search_max_sec", 0.5))
+    pad_px = int(cfg.get("padding_rule_hypothesis", {}).get("fixed_border_px", 60))
 
     gate_max_medae = float(cfg.get("gate", {}).get("max_median_video_error_bpm", 2.0))
     gate_min_pct_r = float(cfg.get("gate", {}).get("min_pct_waveform_r_above_07", 70.0))
@@ -136,9 +140,14 @@ def main():
         sdir = subjects_map[sid]
         sdata = load_ubfc_subject(sdir, subject_id=sid)
         vid_path = sdata.video_path
+        vid_size_bytes = os.path.getsize(str(vid_path))
+        vid_size_mb = vid_size_bytes / (1024.0 * 1024.0)
+
         orig_w = sdata.video_metadata["width"]
         orig_h = sdata.video_metadata["height"]
-        print(f"\nProcessing {sid} (Resolution: {orig_w}x{orig_h}, Video: {vid_path})...")
+        print(f"\nProcessing {sid}:")
+        print(f"  Exact Video Path: {vid_path}")
+        print(f"  Resolution: {orig_w}x{orig_h}, File Size: {vid_size_bytes:,} bytes ({vid_size_mb:.2f} MB)")
 
         # Read frames
         cap = cv2.VideoCapture(str(vid_path))
@@ -156,11 +165,14 @@ def main():
             results_rows.append({
                 "git_hash": git_hash,
                 "subject_id": sid,
+                "video_path": str(vid_path),
+                "video_size_bytes": vid_size_bytes,
+                "video_size_mb": vid_size_mb,
                 "status": "FAIL_NO_FRAMES",
             })
             continue
 
-        # If tight crop (< 300px), apply padding rule
+        # If tight crop (< 350px), apply padding hypothesis rule
         is_tight_crop = (orig_w < 350 or orig_h < 350)
         if is_tight_crop:
             print(f"  Tight crop detected ({orig_w}x{orig_h}). Applying +{pad_px}px border padding.")
@@ -171,11 +183,12 @@ def main():
         else:
             frames_to_feed = frames
 
-        # Predict with baseline of record (GT-timestamp timing)
+        # Predict with baseline of record (GT-timestamp timing + synchronous worker execution)
         bvp_u, t_u, meta = wrapper.predict_from_frames(
             frames=frames_to_feed,
             timestamps=sdata.time,
             timing_mode="gt_timestamp",
+            synchronous=True,
             fs_target=target_fs,
         )
 
@@ -208,7 +221,8 @@ def main():
         abs_err_secondary = abs(video_hr - secondary_ref_hr)
 
         direct_r = calc_pearson_r(bvp_common, ppg_common)
-        lag_dict = max_lag_waveform_correlation(bvp_common, ppg_common, fs=target_fs, max_lag_sec=2.0)
+        # Limited lag search (+/- 0.5s) per protocol
+        lag_dict = max_lag_waveform_correlation(bvp_common, ppg_common, fs=target_fs, max_lag_sec=max_lag_sec)
         max_lag_r = lag_dict["max_r"]
         best_lag_s = lag_dict["optimal_lag_sec"]
 
@@ -241,7 +255,11 @@ def main():
             "git_hash": git_hash,
             "subject_id": sid,
             "status": "SUCCESS",
-            "resolution": f"{orig_w}x{orig_h}",
+            "video_path": str(vid_path),
+            "video_size_bytes": vid_size_bytes,
+            "video_size_mb": round(vid_size_mb, 2),
+            "video_resolution": f"{orig_w}x{orig_h}",
+            "video_frames": n_frames,
             "is_tight_crop": is_tight_crop,
             "padding_applied": is_tight_crop,
             "primary_ref_hr_bpm": primary_ref_hr,
@@ -250,7 +268,7 @@ def main():
             "error_vs_primary_bpm": abs_err_primary,
             "error_vs_secondary_bpm": abs_err_secondary,
             "waveform_r_direct": direct_r,
-            "waveform_r_max_lag": max_lag_r,
+            "waveform_r_max_lag_05s": max_lag_r,
             "waveform_best_lag_sec": best_lag_s,
             "windowed_mae_bpm": w_mae,
             "windowed_medae_bpm": w_medae,
@@ -260,13 +278,14 @@ def main():
             "snr_db": snr_val,
             "stat_null": meta["face_null_frames"],
             "stat_filled": meta["filled_frames"],
+            "stat_skipped": meta["skipped_frames"],
         })
 
         print(f"  --> {sid}: Video HR: {video_hr:.2f} BPM (GT: {primary_ref_hr:.2f} BPM, Err: {abs_err_primary:.2f} BPM), "
-              f"r_maxlag: {max_lag_r:.4f}, MedAE: {w_medae:.2f} BPM, Acc5: {w_acc5:.1f}%, SNR: {snr_val:.2f} dB")
+              f"r_maxlag: {max_lag_r:.4f} (lag {best_lag_s:+.2f}s), MedAE: {w_medae:.2f} BPM, Acc5: {w_acc5:.1f}%, SNR: {snr_val:.2f} dB")
 
     df_pilot = pd.DataFrame(results_rows)
-    results_csv = PROJECT_ROOT / cfg.get("outputs", {}).get("results_csv", "results/pilot_7_subjects.csv")
+    results_csv = PROJECT_ROOT / cfg.get("outputs", {}).get("results_csv", "results/pilot_4_subjects.csv")
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     df_pilot.to_csv(results_csv, index=False)
     print(f"\n--> Successfully saved pilot results to: {results_csv}")
@@ -275,7 +294,7 @@ def main():
     # GATE EVALUATION
     # =========================================================================
     print("\n" + "=" * 80)
-    print("=== PILOT GATE EVALUATION ===")
+    print("=== PILOT GATE EVALUATION (4 SUBJECTS) ===")
     print("=" * 80)
     print(f"Total Pilot Subjects Evaluated: {len(df_pilot)}")
     success_df = df_pilot[df_pilot["status"] == "SUCCESS"]
@@ -286,7 +305,7 @@ def main():
 
     median_error = float(success_df["error_vs_primary_bpm"].median())
     mean_error = float(success_df["error_vs_primary_bpm"].mean())
-    frac_r_07 = float(np.mean(success_df["waveform_r_max_lag"] >= 0.7) * 100.0)
+    frac_r_07 = float(np.mean(success_df["waveform_r_max_lag_05s"] >= 0.7) * 100.0)
 
     gate1_pass = median_error <= gate_max_medae
     gate2_pass = frac_r_07 >= gate_min_pct_r
@@ -295,14 +314,15 @@ def main():
     print(f"Gate 1 (Median Video Error <= {gate_max_medae:.1f} BPM): "
           f"{median_error:.2f} BPM --> {'PASS [OK]' if gate1_pass else 'FAIL [X]'}")
     print(f"Gate 2 (Waveform r >= 0.7 on >= {gate_min_pct_r:.0f}% of subjects): "
-          f"{frac_r_07:.1f}% ({int(np.sum(success_df['waveform_r_max_lag'] >= 0.7))}/{len(success_df)}) --> {'PASS [OK]' if gate2_pass else 'FAIL [X]'}")
+          f"{frac_r_07:.1f}% ({int(np.sum(success_df['waveform_r_max_lag_05s'] >= 0.7))}/{len(success_df)}) --> {'PASS [OK]' if gate2_pass else 'FAIL [X]'}")
     print(f"Mean Video Error: {mean_error:.2f} BPM")
     print(f"Overall Gate Verdict: {'ALL GATES PASSED [OK]' if overall_pass else 'GATE NOT MET [FAIL]'}")
     print("=" * 80)
 
     summary_cols = [
-        "subject_id", "status", "video_hr_bpm", "primary_ref_hr_bpm",
-        "error_vs_primary_bpm", "waveform_r_max_lag", "windowed_medae_bpm", "windowed_acc5_pct"
+        "subject_id", "video_resolution", "video_size_mb", "video_hr_bpm",
+        "primary_ref_hr_bpm", "error_vs_primary_bpm", "waveform_r_max_lag_05s",
+        "windowed_medae_bpm", "windowed_acc5_pct", "snr_db"
     ]
     print(df_pilot[[c for c in summary_cols if c in df_pilot.columns]].to_string(index=False))
     print("=" * 80)

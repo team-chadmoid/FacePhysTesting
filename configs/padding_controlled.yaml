@@ -1,11 +1,11 @@
-# Configuration for Phase B: Controlled Face-Crop & Border Padding Test
+# Configuration for Phase B: Controlled Face-Crop & Border Padding Test (Frozen Baseline-v1)
 experiment_name: padding_controlled_test
 description: >
   Controlled test of face crop tight borders vs border padding on identical frames.
   For 640x480 subjects (subject1, subject3), crops tightly to the face box (0px margin)
   and compares unpadded vs padded (+60px margin) and full frame.
   For subject4 (native tight crop 242x242), compares unpadded vs padded (+60px margin).
-  All runs use the pre-registered baseline (Path 3: GT-timestamp).
+  All runs use the pre-registered baseline (Path 3: GT-timestamp) with synchronous feeding.
 
 dataset:
   root_dir: "data/ubfc/Data Set 2"
@@ -14,7 +14,12 @@ dataset:
     - subject3
     - subject4
 
-padding_rule:
+padding_rule_hypothesis:
+  origin: "Hypothesis derived from single natively tight subject (subject4)"
+  description: >
+    FacePhys degradation under edge-to-edge face framing (<350px) is mitigated by
+    symmetric reflect border padding. Uncropped full-frame videos (>=350px) retain
+    natural background margin and do not receive padding.
   fixed_border_px: 60
   border_mode: "reflect"
 
@@ -30,13 +35,13 @@ preprocessing:
 
 metrics:
   threshold_bpm: 5.0
-  lag_search_max_sec: 2.0
+  lag_search_max_sec: 0.5   # Limited to +/- 0.5s physiological window per protocol
   snr_delta_hz: 0.1
 
 preregistered_baseline:
   timing_mode: "gt_timestamp"
+  synchronous: true
 
 outputs:
   results_csv: "results/padding_controlled_test.csv"
   plot_dir: "results/plots/padding_controlled"
-

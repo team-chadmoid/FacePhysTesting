@@ -1,0 +1,47 @@
+# Frozen Configuration: baseline-v1
+# Pre-registered Baseline of Record for IEEE SP Cup 2027 (FaceVitals), Round 1
+version: "baseline-v1"
+frozen_date: "2026-11-07"
+description: >
+  Frozen official baseline pipeline configuration for FacePhys under open-rppg.
+  Key settled parameters:
+  1) Timing Mode: 'gt_timestamp' (feeds hardware capture timestamps t_gt[i] directly
+     to update_frame, allowing the watchdog to forward-fill true camera dropouts).
+  2) Execution Mode: synchronous (waits for each frame's face detection & preprocessing
+     before submitting next frame, guaranteeing 100% determinism with 0.000 spread).
+  3) Spatial Framing: full-frame uncropped for resolution >= 350px.
+     Padding Hypothesis (+60px reflect border) applied only to natively tight crops (<350px).
+  4) Signal Processing: 3rd-order Butterworth bandpass [0.7, 3.0] Hz.
+     Video HR from Welch PSD peak (Nfft=16384).
+     Windowed HR: 30s window, 1s stride (Nfft=8192).
+     Waveform correlation: max-lag searched within +/- 0.5s window.
+     SNR: integrated power in f0 +/- 0.1 Hz (+ harmonic 2*f0) vs noise floor [0.7, 3.0] Hz.
+
+model:
+  name: "FacePhys.rlap"
+  library: "open-rppg"
+  timing_mode: "gt_timestamp"
+  synchronous: true
+
+spatial_framing:
+  full_frame_threshold_px: 350
+  padding_rule_hypothesis:
+    origin: "Hypothesis derived from single natively tight subject (subject4)"
+    border_px: 60
+    border_mode: "reflect"
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 0.5
+  snr_delta_hz: 0.1
+

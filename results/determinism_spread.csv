@@ -1,0 +1,5 @@
+git_hash,subject_id,description,run1_hr,run2_hr,run3_hr,hr_spread_bpm,r_maxlag_spread,snr_spread_db,filled_spread,skipped_spread,is_identical
+626c8f76d1fbc1336981a0f7da6fd6059c3b589e,subject1,"subject1 (640x480, full frame)",107.0068359375,107.0068359375,107.0068359375,0.0,0.0,0.0,0,0,True
+626c8f76d1fbc1336981a0f7da6fd6059c3b589e,subject3,"subject3 (640x480, full frame)",88.87939453125,88.87939453125,88.87939453125,0.0,0.0,0.0,0,0,True
+626c8f76d1fbc1336981a0f7da6fd6059c3b589e,subject4,subject4 (padded +60px border -> 362x362),111.181640625,111.181640625,111.181640625,0.0,0.0,0.0,0,0,True
+626c8f76d1fbc1336981a0f7da6fd6059c3b589e,subject5,"subject5 (640x480, full frame)",99.5361328125,99.5361328125,99.5361328125,0.0,0.0,0.0,0,0,True
