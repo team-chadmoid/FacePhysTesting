@@ -293,16 +293,30 @@ def main():
         # Save prediction CSV
         clean_cond = re.sub(r"[^\w\-]", "_", cond)
         pred_csv = preds_dir / f"{clean_cond}_{sid}_facephys_pred.csv"
+        raw_bvp = meta.get("raw_bvp", bvp_u)
+        raw_ts = meta.get("raw_timestamps", None)
+        if raw_ts is None or len(raw_ts) != len(raw_bvp):
+            if len(t_gt) == len(raw_bvp):
+                raw_ts = t_gt
+            else:
+                raw_ts = np.arange(len(raw_bvp)) / fs_u
+
+        min_len = min(len(raw_bvp), len(raw_ts))
         df_pred = pd.DataFrame({
-            "frame_idx": np.arange(len(meta.get("raw_bvp", bvp_u))),
-            "gt_timestamp_sec": meta.get("orig_timestamps", t_u)[:len(meta.get("raw_bvp", bvp_u))],
-            "facephys_bvp_raw": meta.get("raw_bvp", bvp_u),
+            "frame_idx": np.arange(min_len),
+            "gt_timestamp_sec": np.asarray(raw_ts)[:min_len],
+            "facephys_bvp_raw": np.asarray(raw_bvp)[:min_len],
         })
         df_pred.to_csv(pred_csv, index=False)
 
         # Uniform GT
         _, ppg_u = resample_to_uniform(t_gt, ppg_gt, target_fs=fs_u)
         _, hr_line_u = resample_to_uniform(t_gt, hr_gt, target_fs=fs_u, method="linear")
+
+        common_len = min(len(bvp_u), len(ppg_u), len(hr_line_u))
+        bvp_u = bvp_u[:common_len]
+        ppg_u = ppg_u[:common_len]
+        hr_line_u = hr_line_u[:common_len]
 
         # Video-level HR
         hr_pred_vid, f_pred, psd_pred = estimate_hr_welch(

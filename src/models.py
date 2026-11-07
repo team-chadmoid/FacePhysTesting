@@ -250,6 +250,7 @@ class FacePhysWrapper:
             "face_stats": stats,
             "raw_bvp": bvp_raw,
             "raw_timestamps": ts_raw,
+            "orig_timestamps": timestamps,
         }
 
         return bvp_uniform, t_uniform, metadata
