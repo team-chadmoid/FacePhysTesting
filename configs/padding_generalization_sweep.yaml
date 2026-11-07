@@ -1,0 +1,48 @@
+# Configuration for Padding Generalization Sweep across 6 Subjects
+experiment_name: padding_generalization_sweep
+description: >
+  Evaluates whether the border padding effect observed on subject4 generalizes across
+  the other 6 subjects (subject1, subject3, subject5, subject8, subject9, subject10).
+  Creates artificial tight crops (face touching edges, 0px margin) mirroring subject4,
+  then sweeps symmetric reflect padding as a fraction of crop width (0%, 15%, 30%, 45%, 60%).
+  Evaluates video HR error, waveform r (+/-0.5s lag), SNR, and Acc5.
+  Rule criteria: Only propose a general rule in terms of face-to-frame ratio if the trend
+  replicates on at least 4 of 6 subjects; otherwise keep as an observation for subject4 only.
+
+dataset:
+  root_dir: "data/ubfc/Data Set 2"
+  subjects:
+    - subject1
+    - subject3
+    - subject5
+    - subject8
+    - subject9
+    - subject10
+
+padding_sweep:
+  fractions_of_crop_width: [0.00, 0.15, 0.30, 0.45, 0.60]
+  border_mode: "reflect"
+
+preprocessing:
+  target_fs: 30.0
+  bandpass:
+    lowcut: 0.7
+    highcut: 3.0
+    order: 3
+  windowing:
+    window_sec: 30.0
+    stride_sec: 1.0
+
+metrics:
+  threshold_bpm: 5.0
+  lag_search_max_sec: 0.5
+  snr_delta_hz: 0.1
+
+preregistered_baseline:
+  timing_mode: "gt_timestamp"
+  synchronous: true
+
+outputs:
+  results_csv: "results/padding_generalization_sweep.csv"
+  plot_dir: "results/plots/padding_generalization"
+

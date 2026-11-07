@@ -2,15 +2,26 @@
 
 Runs subject5 through the frozen Baseline-v1 pipeline (Path 3 GT-timestamp, synchronous=True)
 and asserts reproduction against stored golden reference values.
-Teammates can run this script to confirm their local environment achieves bit-exact parity.
+Teammates can run this script to confirm their local environment achieves parity.
+
+Modes:
+  - Strict mode (default): Bit-exact assertion (tolerances <= 1e-3, frame counts exact).
+  - Tolerance mode (--tolerance-mode): Relaxed cross-architecture bounds (HR +/-0.5 BPM, r +/-0.05).
+
+Records:
+  - Operating System, OS release/version
+  - Processor / CPU model and architecture
+  - Logical thread count & OpenCV execution threads
 
 Exit codes:
-  0: Success (all metrics match stored reference values within tolerance)
+  0: Success (all metrics pass verification)
   1: Failure (metric mismatch or error)
 """
 
+import argparse
 import math
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -55,11 +66,38 @@ GOLDEN_REFERENCE = {
 }
 
 
-def run_golden_check() -> bool:
+def get_system_hardware_info() -> dict:
+    """Retrieve detailed OS, CPU, and thread environment information."""
+    os_name = f"{platform.system()} {platform.release()} ({platform.version()})"
+    cpu_model = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "Unknown CPU")
+    cpu_threads = os.cpu_count() or 1
+    cv2_threads = cv2.getNumThreads()
+    py_ver = sys.version.split()[0]
+    return {
+        "os": os_name,
+        "cpu": cpu_model,
+        "logical_threads": cpu_threads,
+        "cv2_threads": cv2_threads,
+        "python_version": py_ver,
+    }
+
+
+def run_golden_check(tolerance_mode: bool = False) -> bool:
+    sys_info = get_system_hardware_info()
+    mode_str = "TOLERANCE MODE (Cross-architecture relaxed verification)" if tolerance_mode else "STRICT MODE (Exact bit-parity verification)"
+
     print("=" * 80)
     print("=== IEEE SP Cup 2027: Baseline-v1 Golden Reproduction Check ===")
-    print("Target: Subject 5 (UBFC Dataset 2)")
-    print("Pipeline: FacePhysWrapper (timing_mode='gt_timestamp', synchronous=True)")
+    print(f"Target: Subject 5 (UBFC Dataset 2)")
+    print(f"Pipeline: FacePhysWrapper (timing_mode='gt_timestamp', synchronous=True)")
+    print(f"Mode: {mode_str}")
+    print("-" * 80)
+    print("Host Environment Hardware Metadata:")
+    print(f"  OS:              {sys_info['os']}")
+    print(f"  CPU / Processor: {sys_info['cpu']}")
+    print(f"  Logical Threads: {sys_info['logical_threads']}")
+    print(f"  OpenCV Threads:  {sys_info['cv2_threads']}")
+    print(f"  Python Version:  {sys_info['python_version']}")
     print("=" * 80)
 
     dataset_root = PROJECT_ROOT / "data" / "ubfc" / "Data Set 2"
@@ -157,20 +195,39 @@ def run_golden_check() -> bool:
     print("\nVerification Results:")
     print("-" * 80)
     all_passed = True
-    tolerances = {
-        "primary_ref_hr_bpm": 1e-4,
-        "video_hr_bpm": 1e-4,
-        "error_bpm": 1e-4,
-        "waveform_r_direct": 1e-3,
-        "waveform_r_max_lag_05s": 1e-3,
-        "waveform_best_lag_sec": 1e-3,
-        "windowed_medae_bpm": 1e-4,
-        "windowed_acc5_pct": 1e-3,
-        "snr_db": 1e-3,
-        "stat_filled": 0,
-        "stat_null": 0,
-        "stat_skipped": 0,
-    }
+
+    if tolerance_mode:
+        # Relaxed bounds for cross-architecture / cross-platform CPU differences
+        tolerances = {
+            "primary_ref_hr_bpm": 0.1,
+            "video_hr_bpm": 0.5,
+            "error_bpm": 0.5,
+            "waveform_r_direct": 0.05,
+            "waveform_r_max_lag_05s": 0.05,
+            "waveform_best_lag_sec": 0.1,
+            "windowed_medae_bpm": 0.5,
+            "windowed_acc5_pct": 5.0,
+            "snr_db": 1.0,
+            "stat_filled": 0,
+            "stat_null": 0,
+            "stat_skipped": 0,
+        }
+    else:
+        # Strict bit-exact reproduction
+        tolerances = {
+            "primary_ref_hr_bpm": 1e-4,
+            "video_hr_bpm": 1e-4,
+            "error_bpm": 1e-4,
+            "waveform_r_direct": 1e-3,
+            "waveform_r_max_lag_05s": 1e-3,
+            "waveform_best_lag_sec": 1e-3,
+            "windowed_medae_bpm": 1e-4,
+            "windowed_acc5_pct": 1e-3,
+            "snr_db": 1e-3,
+            "stat_filled": 0,
+            "stat_null": 0,
+            "stat_skipped": 0,
+        }
 
     for key, tol in tolerances.items():
         ref_v = GOLDEN_REFERENCE[key]
@@ -190,13 +247,23 @@ def run_golden_check() -> bool:
 
     print("-" * 80)
     if all_passed:
-        print("SUCCESS: Golden check PASSED! All metrics reproduce bit-exact reference values.")
+        print(f"SUCCESS: Golden check PASSED under {mode_str}!")
         return True
     else:
-        print("FAILURE: One or more metrics deviated from golden reference values.")
+        print(f"FAILURE: One or more metrics deviated from golden reference values under {mode_str}.")
         return False
 
 
 if __name__ == "__main__":
-    success = run_golden_check()
+    parser = argparse.ArgumentParser(description="Golden Check for Baseline-v1 reproduction.")
+    parser.add_argument(
+        "--tolerance-mode",
+        "-t",
+        action="store_true",
+        help="Enable relaxed tolerance mode for cross-platform / cross-CPU architecture verification.",
+    )
+    args = parser.parse_args()
+
+    success = run_golden_check(tolerance_mode=args.tolerance_mode)
     sys.exit(0 if success else 1)
+

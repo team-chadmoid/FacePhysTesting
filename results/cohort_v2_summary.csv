@@ -1,0 +1,3 @@
+cohort_variant,n_subjects,video_medae_bpm,video_mae_bpm,video_rmse_bpm,video_pearson_r,bland_altman_bias_bpm,bland_altman_lower_loa,bland_altman_upper_loa,pct_subjects_waveform_r_ge_07,gate_medae_le_2bpm,gate_pct_r_ge_07
+Variant A: subject4 padded (+60px reflect),7,0.2197265625,1.9147600446428572,4.615005121244474,0.9105910361781614,-1.7578125,-10.791498086778063,7.275873086778063,85.71428571428571,True,True
+Variant B: subject4 unpadded (native 242x242),7,0.32958984375,8.883231026785714,19.005667235640058,0.29673937864601535,-8.726283482142858,-44.47028878299729,27.017721818711575,85.71428571428571,True,True

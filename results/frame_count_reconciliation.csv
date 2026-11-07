@@ -1,0 +1,8 @@
+subject_id,file_size_bytes,file_size_mb,opencv_frames,pyav_frames,pyav_stream_frames_meta,gt_time_len,gt_ppg_len,gt_hr_len,match_cv2_pyav,match_frames_gt
+subject1,1425830568,1359.78,1547,1547,1547,1547,1547,1547,True,True
+subject3,1659925096,1583.03,1801,1801,1801,1801,1801,1801,True,True
+subject4,199630138,190.38,1368,1368,1368,1368,1368,1368,True,True
+subject5,1428595464,1362.41,1550,1550,1550,1550,1550,1550,True,True
+subject8,1863605768,1777.27,2022,2022,2022,2022,2022,2022,True,True
+subject9,1858075976,1772.0,2016,2016,2016,2016,2016,2016,True,True
+subject10,1865449032,1779.03,2024,2024,2024,2024,2024,2024,True,True
