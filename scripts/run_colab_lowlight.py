@@ -33,10 +33,19 @@ Memory safety & Subprocess Isolation:
   memory across subjects.
 """
 
+import os
+# Prevent OpenMP and OpenCV multi-threaded allocator contention and bound JAX memory on Linux
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.20"
+
 import argparse
 import gc
 import json
-import os
 import re
 import subprocess
 import sys
@@ -46,6 +55,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+cv2.setNumThreads(0)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -587,6 +597,27 @@ def main():
         else:
             lux_total += len(cond_entries)
 
+    # Cross-condition consistency check: identify missing subjects per condition
+    all_base_subs = sorted(set(e["base_subject_id"] for e in entries))
+    cond_subject_map: Dict[str, set] = {}
+    for e in entries:
+        cond_subject_map.setdefault(e["condition"], set()).add(e["base_subject_id"])
+
+    missing_report: List[str] = []
+    for cond in conditions_found:
+        cond_subs = cond_subject_map.get(cond, set())
+        missing = sorted(set(all_base_subs) - cond_subs)
+        if missing and len(cond_subs) < len(all_base_subs):
+            missing_report.append(
+                f"  ⚠ Condition '{cond}': MISSING {len(missing)} subjects vs full cohort of {len(all_base_subs)}: "
+                + ", ".join(missing)
+            )
+
+    if missing_report:
+        print("\nCross-condition consistency check:")
+        for line in missing_report:
+            print(line)
+
     print("-" * 80)
     print(f"Total runs to process: {len(entries)} (Lux: {lux_total}, Original: {orig_total})")
     if len(entries) == 252:
@@ -594,7 +625,10 @@ def main():
     elif len(entries) == 267:
         print("  ✓ Full dataset with lux duplicates: 225 lux runs (45 x 5) + 42 original = 267 runs.")
     else:
-        print(f"  ℹ Discovered {len(entries)} runs across {len(conditions_found)} conditions.")
+        expected = len(all_base_subs) * len(conditions_found)
+        print(f"  ℹ Discovered {len(entries)} runs across {len(conditions_found)} conditions (expected {expected} = {len(all_base_subs)} subjects x {len(conditions_found)} conditions).")
+        if missing_report:
+            print(f"  ⚠ {len(entries)} < {expected}: see missing subject report above. Check if folders exist in Drive with ground_truth.txt + vid.avi.")
     print("=" * 80 + "\n")
 
     summary_path = PROJECT_ROOT / cfg.get("outputs", {}).get("summary_csv", "results/ubfc_lowlight_conditions.csv")
@@ -673,8 +707,17 @@ def main():
             "--config", str(args.config),
         ]
 
+        worker_env = os.environ.copy()
+        worker_env["OMP_NUM_THREADS"] = "1"
+        worker_env["OPENBLAS_NUM_THREADS"] = "1"
+        worker_env["MKL_NUM_THREADS"] = "1"
+        worker_env["VECLIB_MAXIMUM_THREADS"] = "1"
+        worker_env["NUMEXPR_NUM_THREADS"] = "1"
+        worker_env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        worker_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.20"
+
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=worker_env)
             if proc.returncode == 0 and tmp_json.is_file():
                 with open(tmp_json, "r", encoding="utf-8") as f:
                     row_dict = json.load(f)
