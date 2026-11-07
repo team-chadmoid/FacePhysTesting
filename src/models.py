@@ -55,23 +55,71 @@ class FacePhysWrapper:
         import rppg
         return rppg.Model(self.model_name)
 
-    def _cleanup_model_pools(self, model: Any) -> None:
-        """Safely drain and shut down all worker thread pools in open-rppg Model.
+    def _cleanup_model_safe(self, model: Any) -> Tuple[np.ndarray, np.ndarray, dict]:
+        """Safely shut down the open-rppg Model and extract BVP, replacing `with model:`.
 
         open-rppg's __exit__ shuts down face_detection_pool but omits face_resampling_pool,
-        leaving dangling worker threads that cause heap corruption (corrupted double-linked list)
-        on Linux during subsequent garbage collection or process exit.
+        leaving dangling ThreadPoolExecutor workers that corrupt the glibc heap
+        (``corrupted double-linked list`` / ``double free or corruption (!prev)``).
+
+        This method manually replicates __exit__'s teardown in the correct order:
+        1. Wait for pending face_detection_task.
+        2. Signal inference thread to stop (alive=False, sp.release).
+        3. Join inference thread (which may do a final face_resampling_pool.map).
+        4. Join any self.run thread (wait_completion).
+        5. Shut down BOTH face_resampling_pool AND face_detection_pool.
+        6. Extract BVP + timestamps while model data structures are still valid.
         """
-        if hasattr(model, "face_resampling_pool") and model.face_resampling_pool is not None:
+        # Step 1: wait for in-flight face detection
+        if hasattr(model, "face_detection_task") and model.face_detection_task is not None:
             try:
-                model.face_resampling_pool.shutdown(wait=True)
+                model.face_detection_task.result()
             except Exception:
                 pass
-        if hasattr(model, "face_detection_pool") and model.face_detection_pool is not None:
+
+        # Step 2: signal inference thread to stop
+        model.alive = False
+        if hasattr(model, "sp"):
             try:
-                model.face_detection_pool.shutdown(wait=True)
+                model.sp.release()
             except Exception:
                 pass
+
+        # Step 3: join inference thread
+        if hasattr(model, "ift") and model.ift is not None:
+            try:
+                model.ift.join(timeout=120)
+            except Exception:
+                pass
+
+        # Step 4: join any run thread
+        if hasattr(model, "wait_completion"):
+            try:
+                model.wait_completion()
+            except Exception:
+                pass
+
+        # Step 5: shut down BOTH thread pools (the root cause of heap corruption)
+        for pool_name in ("face_resampling_pool", "face_detection_pool"):
+            pool = getattr(model, pool_name, None)
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=True)
+                except Exception:
+                    pass
+
+        # Step 6: extract BVP while model data is still valid
+        try:
+            bvp_raw, ts_raw = model.bvp(raw=True)
+            bvp_raw = np.asarray(bvp_raw, dtype=np.float64)
+            ts_raw = np.asarray(ts_raw, dtype=np.float64) if len(ts_raw) > 0 else np.array([])
+        except Exception:
+            bvp_raw = np.array([], dtype=np.float64)
+            ts_raw = np.array([], dtype=np.float64)
+
+        stats = dict(getattr(model, "statistic", {}))
+
+        return bvp_raw, ts_raw, stats
 
     def predict_video(
         self,
@@ -112,6 +160,10 @@ class FacePhysWrapper:
         n_frames = 0
         use_pyav = (timing_mode == "container")
 
+        # Start model (replaces `with model:` — we handle teardown ourselves
+        # via _cleanup_model_safe to avoid the heap corruption in __exit__)
+        model.__enter__()
+
         if use_pyav:
             try:
                 import av
@@ -122,22 +174,21 @@ class FacePhysWrapper:
                 height = stream.height or 0
                 total_frames = stream.frames or 0
 
-                with model:
-                    for idx, frame in enumerate(container.decode(stream)):
-                        img = frame.to_ndarray(format="rgb24")
-                        rotation = -frame.rotation % 360
-                        if rotation == 90:
-                            img = img.swapaxes(0, 1)[:, ::-1, :]
-                        elif rotation == 180:
-                            img = img[::-1, ::-1, :]
-                        elif rotation == 270:
-                            img = img.swapaxes(0, 1)[::-1, :, :]
+                for idx, frame in enumerate(container.decode(stream)):
+                    img = frame.to_ndarray(format="rgb24")
+                    rotation = -frame.rotation % 360
+                    if rotation == 90:
+                        img = img.swapaxes(0, 1)[:, ::-1, :]
+                    elif rotation == 180:
+                        img = img[::-1, ::-1, :]
+                    elif rotation == 270:
+                        img = img.swapaxes(0, 1)[::-1, :, :]
 
-                        pts_sec = float(frame.time) if frame.time is not None else float(idx / fs_target)
-                        model.update_frame(img, pts_sec)
-                        if synchronous and model.face_detection_task is not None:
-                            model.face_detection_task.result()
-                        n_frames += 1
+                    pts_sec = float(frame.time) if frame.time is not None else float(idx / fs_target)
+                    model.update_frame(img, pts_sec)
+                    if synchronous and model.face_detection_task is not None:
+                        model.face_detection_task.result()
+                    n_frames += 1
                 container.close()
             except Exception:
                 # Fallback to OpenCV if PyAV fails
@@ -147,6 +198,8 @@ class FacePhysWrapper:
         if not use_pyav:
             cap = cv2.VideoCapture(str(path))
             if not cap.isOpened():
+                # Must still tear down the model we __enter__'d
+                self._cleanup_model_safe(model)
                 raise IOError(f"Could not open video file: {path}")
 
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -156,33 +209,27 @@ class FacePhysWrapper:
             use_ts = (timing_mode == "gt_timestamp" and timestamps is not None)
             feed_ts = np.asarray(timestamps, dtype=np.float64) if use_ts else None
 
-            with model:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    if use_ts and feed_ts is not None and n_frames < len(feed_ts):
-                        ts_val = float(feed_ts[n_frames])
-                    else:
-                        ts_val = float(n_frames / fs_target)
-                    model.update_frame(frame_rgb, ts_val)
-                    if synchronous and model.face_detection_task is not None:
-                        model.face_detection_task.result()
-                    n_frames += 1
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if use_ts and feed_ts is not None and n_frames < len(feed_ts):
+                    ts_val = float(feed_ts[n_frames])
+                else:
+                    ts_val = float(n_frames / fs_target)
+                model.update_frame(frame_rgb, ts_val)
+                if synchronous and model.face_detection_task is not None:
+                    model.face_detection_task.result()
+                n_frames += 1
             cap.release()
 
-        # Cleanly terminate all background worker pools
-        self._cleanup_model_pools(model)
+        # Safe teardown: shut down ALL pools + extract BVP before any state is freed
+        bvp_raw, ts_raw, stats = self._cleanup_model_safe(model)
 
         if n_frames == 0:
             raise ValueError(f"No frames could be read from video {path}")
 
-        bvp_raw, ts_raw = model.bvp(raw=True)
-        bvp_raw = np.asarray(bvp_raw, dtype=np.float64)
-        ts_raw = np.asarray(ts_raw, dtype=np.float64) if len(ts_raw) > 0 else np.array([])
-
-        stats = dict(getattr(model, "statistic", {}))
         null_count = stats.get("null", 0)
         filled_count = stats.get("filled", 0)
         skipped_count = stats.get("skipped", 0)
@@ -258,23 +305,20 @@ class FacePhysWrapper:
             use_ts = False
             ts_to_feed = np.arange(n_frames, dtype=np.float64) / fs_target
 
-        with model:
-            for idx, frame in enumerate(frames):
-                if use_ts:
-                    model.update_frame(frame, float(ts_to_feed[idx]))
-                else:
-                    model.update_frame(frame, float(idx / fs_target))
-                if synchronous and model.face_detection_task is not None:
-                    model.face_detection_task.result()
+        # Start model manually (no `with model:` — we do our own safe teardown)
+        model.__enter__()
 
-        # Cleanly terminate all background worker pools
-        self._cleanup_model_pools(model)
+        for idx, frame in enumerate(frames):
+            if use_ts:
+                model.update_frame(frame, float(ts_to_feed[idx]))
+            else:
+                model.update_frame(frame, float(idx / fs_target))
+            if synchronous and model.face_detection_task is not None:
+                model.face_detection_task.result()
 
-        bvp_raw, ts_raw = model.bvp(raw=True)
-        bvp_raw = np.asarray(bvp_raw, dtype=np.float64)
-        ts_raw = np.asarray(ts_raw, dtype=np.float64) if len(ts_raw) > 0 else np.array([])
+        # Safe teardown: shut down ALL pools + extract BVP before any state is freed
+        bvp_raw, ts_raw, stats = self._cleanup_model_safe(model)
 
-        stats = dict(getattr(model, "statistic", {}))
         null_count = stats.get("null", 0)
         filled_count = stats.get("filled", 0)
         skipped_count = stats.get("skipped", 0)

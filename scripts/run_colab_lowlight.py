@@ -168,6 +168,13 @@ def find_lowlight_directories(
     search_roots: List[Path] = []
     if root_dir.is_dir():
         search_roots.append(root_dir)
+        # Explicitly add each condition subfolder as a separate search root.
+        # Google Drive's FUSE filesystem sometimes returns incomplete directory
+        # listings for os.walk when the parent directory has many entries.
+        # Walking each lux subfolder independently avoids this.
+        for child in sorted(root_dir.iterdir()):
+            if child.is_dir() and child not in search_roots:
+                search_roots.append(child)
     
     if original_dir and original_dir.is_dir() and original_dir not in search_roots:
         search_roots.append(original_dir)
