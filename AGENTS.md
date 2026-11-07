@@ -9,8 +9,10 @@ Metrics: MAE, RMSE, Pearson r, Bland-Altman limits of agreement (all BPM).
 ## Hard rules
 1. Never fabricate numbers. Every figure or table value comes from a CSV in results/
    written by a script in this repo, with the git hash recorded.
-2. FacePhys weights are licensed for LOCAL inference only. No cloud notebooks,
-   no uploading videos, no server-side runs. Read the LICENSE before any deployment change.
+2. Private cloud / Google Colab runs are permitted for authorized private datasets
+   (e.g., user-provided UBFC_lowlight on Google Drive) per user instruction.
+   No public notebooks, no public uploading of patient/hospital/organizer data.
+   Read model licenses before any commercial or public deployment.
 3. data/ is gitignored. Never commit or upload organizer/hospital data.
 4. Do not silently drop videos or "correct" ground-truth offsets. Log every exclusion
    with a reason in results/exclusions.csv.

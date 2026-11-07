@@ -1,0 +1,27 @@
+# Configuration for UBFC Low-Light (C1 Condition) on Google Colab / Local
+experiment_name: "ubfc_lowlight_c1_evaluation"
+seed: 42
+
+dataset:
+  # In Colab: /content/drive/MyDrive/UBFC_lowlight
+  # Local fallback: data/ubfc/UBFC_lowlight
+  root_dir: "/content/drive/MyDrive/UBFC_lowlight"
+  fallback_local_dir: "data/ubfc/UBFC_lowlight"
+
+parameters:
+  fs_uniform: 30.0
+  window_sec: 30.0
+  stride_sec: 1.0
+  bandpass_low: 0.7
+  bandpass_high: 3.0
+  filter_order: 3
+  nfft_welch: 8192
+  nfft_video: 16384
+  reliability_threshold_bpm: 5.0
+  snr_delta_hz: 0.1
+  lag_search_max_sec: 2.0
+
+outputs:
+  preds_dir: "results/preds"
+  plots_dir: "results/plots"
+  summary_csv: "results/ubfc_lowlight_conditions.csv"
