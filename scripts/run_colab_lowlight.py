@@ -12,6 +12,17 @@ Outputs:
 - results/ubfc_lowlight_conditions.csv
 - results/exclusions.csv (logs any excluded/failed subject per AGENTS.md rule 4)
 
+Cohort Size & Deduplication:
+- UBFC Dataset 2 contains exactly 42 unique subjects (subject1 through subject49, with a
+  few non-contiguous indices missing in the benchmark).
+- Across the 6 benchmark conditions (5 low-light variations: lux1, lux5, lux10, lux30, lux50
+  plus original_baseline), the clean evaluation cohort is exactly 42 x 6 = 252 video runs.
+- Duplicate folders created by Google Drive / cloud download artifacts (e.g. 'subject22 (1)',
+  'subject31 (1)', 'subject34 (1)') and redundant directory scans (e.g. DATASET_2 traversed
+  both inside UBFC_lowlight and at MyDrive root) are automatically deduplicated by default.
+  All excluded duplicate folders are logged to results/exclusions.csv per AGENTS.md rule 4.
+- Passing ``--include-duplicates`` allows processing all 309 raw discovered folders if desired.
+
 Memory safety & Subprocess Isolation:
 - FacePhys (JAX / Mamba SSM) creates background threads and C-extension buffers.
   Running hundreds of subjects in a single Python process corrupts glibc heap metadata,
@@ -20,16 +31,6 @@ Memory safety & Subprocess Isolation:
   When the worker finishes inference and writes its JSON result, the OS kernel reclaims
   100% of heap allocations and thread resources. The coordinator process never accumulates
   memory across subjects.
-
-Duplicate Subject Handling:
-- In UBFC low-light, the lux folders (lux1, lux5, lux10, lux30, lux50) contain duplicate
-  recordings/folders for: subject22, subject31, and subject34 (45 folders per lux condition:
-  42 unique base subjects + 3 duplicate entries).
-- In DATASET_2 (original_baseline), these 3 subjects only appear once (42 folders total).
-- The discovery pipeline disambiguates duplicates deterministically by assigning
-  ``{subject}_dup1`` (e.g. subject22_dup1, subject31_dup1, subject34_dup1) so that no
-  prediction CSV or summary CSV row is overwritten or skipped on resume.
-- Grand total: 5 x 45 (lux) + 42 (original) = 267 runs.
 """
 
 import argparse
@@ -113,7 +114,6 @@ def normalize_condition_name(raw_name: str) -> str:
     if any(x in clean for x in ["data set 2", "dataset 2", "dataset2", "original", "baseline"]):
         return "original_baseline"
     
-    # Check for lux pattern: e.g. 50lux or lux50
     m_num_first = re.search(r"(\d+)\s*lux", clean)
     if m_num_first:
         return f"lux{m_num_first.group(1)}"
@@ -124,24 +124,36 @@ def normalize_condition_name(raw_name: str) -> str:
     return raw_name.strip()
 
 
-def find_lowlight_directories(root_dir: Path, original_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+def is_canonical_folder(path: Path) -> int:
+    """Return penalty score for duplicate/copy artifacts (lower score is more canonical)."""
+    score = 0
+    name = path.name.lower()
+    path_str = str(path).lower()
+    if re.search(r"\(\d+\)", name) or re.search(r"\(\d+\)", path_str):
+        score += 100
+    if "copy" in name or "copy" in path_str:
+        score += 50
+    if "dup" in name or "dup" in path_str:
+        score += 50
+    score += len(path_str)  # Prefer cleaner / shorter paths
+    return score
+
+
+def find_lowlight_directories(
+    root_dir: Path,
+    original_dir: Optional[Path] = None,
+    include_duplicates: bool = False,
+    exclusions_csv: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     """Recursively discover all video/GT subject folders under root_dir and optional original_dir.
 
     Handles:
     - Follows Google Drive shortcuts / symlinks (followlinks=True).
     - Case-insensitive video and GT file extensions (.avi, .mp4, .mov, etc.).
-    - Disambiguates duplicate entries (e.g. subject22, subject31, subject34 in lux folders)
-      by deterministically naming subsequent occurrences '{subject}_dup1', '{subject}_dup2'.
-    - Discovers 267 total runs (225 lux [45 x 5] + 42 original_baseline).
-
-    Returns a list of dicts:
-        - condition: standardized condition (e.g. 'lux50', 'original_baseline')
-        - subject_id: unique subject identifier (e.g. 'subject1', 'subject22_dup1')
-        - base_subject_id: base subject name (e.g. 'subject22')
-        - is_duplicate: True if this is a secondary duplicate recording
-        - subject_dir: Path to directory
-        - gt_path: Path to ground_truth.txt
-        - video_path: Path to video file
+    - By default (include_duplicates=False), automatically filters out duplicate copies
+      (such as Google Drive '(1)' artifacts and redundant DATASET_2 scans) to produce
+      the clean 42 subjects x 6 conditions = 252 run benchmark cohort.
+    - Excluded duplicates are logged to results/exclusions.csv per AGENTS.md rule 4.
     """
     search_roots: List[Path] = []
     if root_dir.is_dir():
@@ -215,48 +227,73 @@ def find_lowlight_directories(root_dir: Path, original_dir: Optional[Path] = Non
                 "video_path": vid_path,
             })
 
-    # Sort deterministically by condition, base_subject_id, and str(subject_dir)
-    raw_discovered.sort(key=lambda x: (x["condition"], x["base_subject_id"], str(x["subject_dir"])))
-
-    # Deduplicate / disambiguate duplicate entries per condition
-    entries: List[Dict[str, Any]] = []
-    seen_in_cond: Dict[Tuple[str, str], int] = {}
-    duplicate_logs: List[str] = []
-
+    # Group by (condition, base_subject_id)
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for item in raw_discovered:
-        cond = item["condition"]
-        base_sub = item["base_subject_id"]
-        key = (cond, base_sub)
+        key = (item["condition"], item["base_subject_id"])
+        grouped.setdefault(key, []).append(item)
 
-        count = seen_in_cond.get(key, 0) + 1
-        seen_in_cond[key] = count
+    entries: List[Dict[str, Any]] = []
+    excluded_logs: List[str] = []
 
-        if count == 1:
-            unique_sub_id = base_sub
-            is_dup = False
-        else:
-            unique_sub_id = f"{base_sub}_dup{count - 1}"
-            is_dup = True
-            duplicate_logs.append(
-                f"  [DISAMBIGUATED] Condition '{cond}': '{base_sub}' duplicate #{count - 1} "
-                f"-> assigned unique subject_id='{unique_sub_id}' (path: {item['subject_dir'].name})"
-            )
+    def sort_key_fn(item_tuple):
+        cond, sid = item_tuple[0]
+        m = re.search(r"\d+", sid)
+        num = int(m.group(0)) if m else 9999
+        return (cond, num, sid)
 
+    for (cond, base_sub), items in sorted(grouped.items(), key=sort_key_fn):
+        # Sort items: canonical (lowest penalty score) first
+        items.sort(key=lambda x: (is_canonical_folder(x["subject_dir"]), str(x["subject_dir"])))
+
+        canonical_item = items[0]
         entries.append({
             "condition": cond,
-            "subject_id": unique_sub_id,
+            "subject_id": base_sub,
             "base_subject_id": base_sub,
-            "is_duplicate": is_dup,
-            "subject_dir": item["subject_dir"],
-            "gt_path": item["gt_path"],
-            "video_path": item["video_path"],
+            "is_duplicate": False,
+            "subject_dir": canonical_item["subject_dir"],
+            "gt_path": canonical_item["gt_path"],
+            "video_path": canonical_item["video_path"],
         })
 
-    # Print duplicate disambiguation info if any
-    if duplicate_logs:
-        print("\nDisambiguated duplicate subject entries:")
-        for log_line in duplicate_logs:
-            print(log_line)
+        # Process any duplicate folders for this subject in this condition
+        for dup_idx, dup_item in enumerate(items[1:], start=1):
+            if include_duplicates:
+                dup_sid = f"{base_sub}_dup{dup_idx}"
+                entries.append({
+                    "condition": cond,
+                    "subject_id": dup_sid,
+                    "base_subject_id": base_sub,
+                    "is_duplicate": True,
+                    "subject_dir": dup_item["subject_dir"],
+                    "gt_path": dup_item["gt_path"],
+                    "video_path": dup_item["video_path"],
+                })
+            else:
+                # Log exclusion per AGENTS.md rule 4
+                reason = f"Excluded duplicate folder artifact (canonical: '{canonical_item['subject_dir'].name}')"
+                if exclusions_csv:
+                    log_exclusion(
+                        subject_id=f"{cond}_{base_sub}_copy{dup_idx}",
+                        reason=f"{reason} at {dup_item['subject_dir']}",
+                        exclusions_csv=exclusions_csv,
+                    )
+                excluded_logs.append(
+                    f"  [EXCLUDED DUPLICATE] Condition '{cond}': '{base_sub}' duplicate folder '{dup_item['subject_dir'].name}' excluded in favor of canonical '{canonical_item['subject_dir'].name}'"
+                )
+
+    if excluded_logs and not include_duplicates:
+        print("\nExcluded duplicate folder artifacts (logged to results/exclusions.csv):")
+        # Print summary per condition
+        cond_counts: Dict[str, int] = {}
+        for line in excluded_logs:
+            m = re.search(r"Condition '([^']+)':", line)
+            if m:
+                c = m.group(1)
+                cond_counts[c] = cond_counts.get(c, 0) + 1
+        for c, cnt in sorted(cond_counts.items()):
+            print(f"  • Condition '{c}': {cnt} duplicate folder(s) excluded")
 
     return entries
 
@@ -275,7 +312,6 @@ def run_worker_task(
     This function is executed inside a fresh subprocess to prevent memory leaks and
     glibc allocator corruption across hundreds of sequential runs.
     """
-    # Load config inside worker
     if config_path.is_file():
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
@@ -435,6 +471,7 @@ def main():
     parser.add_argument("--subjects", nargs="+", default=None, help="Filter specific subjects (e.g. subject1 subject3 subject4)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of subject runs to process")
     parser.add_argument("--no-subprocess", action="store_true", help="Run directly in-process instead of spawning isolated worker processes")
+    parser.add_argument("--include-duplicates", action="store_true", help="Include duplicate folder recordings (e.g. subject22 (1)) instead of excluding them")
 
     # Internal worker mode flags
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -515,7 +552,13 @@ def main():
         print("and added 'UBFC_lowlight' to My Drive.")
         sys.exit(1)
 
-    entries = find_lowlight_directories(data_root, original_dir=orig_root)
+    exclusions_path = PROJECT_ROOT / "results/exclusions.csv"
+    entries = find_lowlight_directories(
+        root_dir=data_root,
+        original_dir=orig_root,
+        include_duplicates=args.include_duplicates,
+        exclusions_csv=exclusions_path,
+    )
     if not entries:
         print(f"No valid subjects with ground_truth.txt and video files found in {data_root}.")
         sys.exit(1)
@@ -546,15 +589,16 @@ def main():
 
     print("-" * 80)
     print(f"Total runs to process: {len(entries)} (Lux: {lux_total}, Original: {orig_total})")
-    if len(entries) == 267:
-        print("  ✓ Full dataset confirmed: 225 lux runs (45 x 5 conditions) + 42 original baseline runs = 267 total.")
+    if len(entries) == 252:
+        print("  ✓ Clean cohort confirmed: Exactly 42 subjects x 6 conditions = 252 runs.")
+    elif len(entries) == 267:
+        print("  ✓ Full dataset with lux duplicates: 225 lux runs (45 x 5) + 42 original = 267 runs.")
     else:
-        print(f"  ℹ Note: Found {len(entries)} runs (expected 267 if all 5 lux conditions [45 ea.] + 42 original are present).")
+        print(f"  ℹ Discovered {len(entries)} runs across {len(conditions_found)} conditions.")
     print("=" * 80 + "\n")
 
     summary_path = PROJECT_ROOT / cfg.get("outputs", {}).get("summary_csv", "results/ubfc_lowlight_conditions.csv")
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    exclusions_path = PROJECT_ROOT / "results/exclusions.csv"
 
     # Resume support: check previously completed runs
     completed_keys = set()
