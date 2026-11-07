@@ -501,7 +501,11 @@ def main():
 
     git_hash = get_git_hash()
 
-    # Worker dispatch branch: run single isolated subject and exit cleanly
+    # Worker dispatch branch: run single isolated subject and exit immediately.
+    # os._exit(0) bypasses Python's interpreter shutdown (GC finalization, atexit
+    # handlers, module cleanup) which triggers heap corruption in open-rppg's
+    # C extensions / JAX / ONNX runtime when processing large rawvideo frames.
+    # The JSON result file is already written; the OS kernel reclaims everything.
     if args.worker:
         run_worker_task(
             condition=args.worker_condition,
@@ -512,7 +516,7 @@ def main():
             config_path=PROJECT_ROOT / args.config,
             git_hash=git_hash,
         )
-        sys.exit(0)
+        os._exit(0)
 
     print("=" * 80)
     print("=== FacePhys Evaluation on UBFC Low-Light (C1 Condition) ===")
