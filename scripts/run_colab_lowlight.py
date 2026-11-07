@@ -155,6 +155,9 @@ def main():
     parser.add_argument("--config", type=str, default="configs/colab_lowlight.yaml", help="Path to config file")
     parser.add_argument("--data-dir", type=str, default=None, help="Root directory of UBFC_lowlight")
     parser.add_argument("--original-dir", type=str, default=None, help="Directory of original Data Set 2 if shortcut or stored separately")
+    parser.add_argument("--conditions", nargs="+", default=None, help="Filter specific conditions (e.g. lux50 lux30 original_baseline)")
+    parser.add_argument("--subjects", nargs="+", default=None, help="Filter specific subjects (e.g. subject1 subject3 subject4)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of subject runs to process")
     args = parser.parse_args()
 
     git_hash = get_git_hash()
@@ -222,9 +225,17 @@ def main():
         print(f"No valid subjects with ground_truth.txt and video files found in {data_root}.")
         sys.exit(1)
 
-    print(f"Found {len(entries)} subject runs across conditions:")
+    # Optional filtering
+    if args.conditions:
+        entries = [e for e in entries if e["condition"] in args.conditions]
+    if args.subjects:
+        entries = [e for e in entries if e["subject_id"] in args.subjects]
+    if args.limit:
+        entries = entries[:args.limit]
+
+    print(f"Found {len(entries)} subject runs to process:")
     conditions_found = sorted(list(set(e["condition"] for e in entries)))
-    print(f"Conditions detected: {conditions_found}")
+    print(f"Conditions: {conditions_found}")
 
     params = cfg.get("parameters", {})
     fs_u = float(params.get("fs_uniform", 30.0))
@@ -242,6 +253,17 @@ def main():
     summary_path = PROJECT_ROOT / cfg.get("outputs", {}).get("summary_csv", "results/ubfc_lowlight_conditions.csv")
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resume support: check previously completed runs
+    completed_keys = set()
+    if summary_path.is_file():
+        try:
+            df_prev = pd.read_csv(summary_path)
+            for _, r in df_prev.iterrows():
+                completed_keys.add((str(r["condition"]), str(r["subject_id"])))
+            print(f"Resume: Found {len(completed_keys)} already completed runs in {summary_path}")
+        except Exception:
+            pass
+
     results = []
 
     for idx, item in enumerate(entries, start=1):
@@ -250,14 +272,15 @@ def main():
         vid_p = item["video_path"]
         gt_p = item["gt_path"]
 
+        if (cond, sid) in completed_keys:
+            print(f"[{idx}/{len(entries)}] Skipping already completed Condition='{cond}', Subject='{sid}'")
+            continue
+
         print(f"\n[{idx}/{len(entries)}] Processing Condition='{cond}', Subject='{sid}'...")
         print(f"  Video: {vid_p}")
 
-        # Load GT
-        gt_data = load_ubfc_ground_truth(gt_p)
-        t_gt = gt_data["time"]
-        ppg_gt = gt_data["ppg"]
-        hr_gt = gt_data["hr"]
+        # Load GT (returns ppg, hr, time)
+        ppg_gt, hr_gt, t_gt = load_ubfc_ground_truth(gt_p)
 
         # Run FacePhys
         bvp_u, t_u, meta = predict_bvp(
@@ -337,7 +360,7 @@ def main():
         print(f"  Pred HR: {hr_pred_vid:.2f} BPM | GT Primary: {primary_ref_hr:.2f} BPM | Error: {abs(hr_pred_vid - primary_ref_hr):.2f} BPM")
         print(f"  Window MAE: {mae_all_prim:.2f} BPM | MedAE: {medae_all_prim:.2f} BPM | Acc<=5BPM: {acc5_all_prim:.1f}% | SNR: {snr_prim:.2f} dB")
 
-        results.append({
+        row_dict = {
             "git_hash": git_hash,
             "condition": cond,
             "subject_id": sid,
@@ -364,25 +387,35 @@ def main():
             "reliable_win_rmse_vs_primary": rmse_rel_prim,
             "reliable_win_r_vs_primary": r_rel_prim,
             "reliable_win_acc5_vs_primary": acc5_rel_prim,
+        }
+        results.append(row_dict)
+
+        # Incremental save per subject run
+        df_row = pd.DataFrame([row_dict])
+        if not summary_path.is_file():
+            df_row.to_csv(summary_path, index=False)
+        else:
+            df_row.to_csv(summary_path, mode="a", header=False, index=False)
+
+    if summary_path.is_file():
+        df_out = pd.read_csv(summary_path)
+        print("\n" + "=" * 80)
+        print(f"Total evaluated runs in summary ({summary_path}): {len(df_out)}")
+        print("=" * 80)
+
+        # Print Condition-Level Aggregates
+        print("\nCondition-Level Summary (Mean across subjects in condition):")
+        cond_summary = df_out.groupby("condition").agg({
+            "video_error_vs_primary_bpm": ["mean", "median"],
+            "all_win_mae_vs_primary": "mean",
+            "all_win_medae_vs_primary": "mean",
+            "all_win_acc5_vs_primary": "mean",
+            "snr_primary_db": "mean",
+            "subject_id": "count",
         })
-
-    df_out = pd.DataFrame(results)
-    df_out.to_csv(summary_path, index=False)
-    print("\n" + "=" * 80)
-    print(f"Saved complete low-light summary to: {summary_path}")
-    print("=" * 80)
-
-    # Print Condition-Level Aggregates
-    print("\nCondition-Level Summary (Mean across subjects in condition):")
-    cond_summary = df_out.groupby("condition").agg({
-        "video_error_vs_primary_bpm": ["mean", "median"],
-        "all_win_mae_vs_primary": "mean",
-        "all_win_medae_vs_primary": "mean",
-        "all_win_acc5_vs_primary": "mean",
-        "snr_primary_db": "mean",
-        "subject_id": "count",
-    })
-    print(cond_summary.to_string())
+        print(cond_summary.to_string())
+    else:
+        print("No results recorded.")
 
 
 if __name__ == "__main__":
