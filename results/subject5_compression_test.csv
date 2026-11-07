@@ -1,0 +1,4 @@
+variant,video_hr_bpm,primary_ref_hr_bpm,error_bpm,waveform_r_direct,waveform_r_max_lag_05s,waveform_best_lag_sec,snr_db,windowed_mae_bpm,windowed_medae_bpm,windowed_rmse_bpm,windowed_acc5_pct,stat_null,stat_filled,stat_skipped,resolution,codec,file_size_mb,bytes_per_pixel
+original_640x480_raw,99.5361,99.3164,0.2197,0.786,0.8991,0.0,9.4,0.1911,0.0,0.3833,100.0,0,0,0,640x480,rawvideo,1362.41,3.0002
+crop_242x242_raw,99.646,99.3164,0.3296,0.5307,0.8283,-0.0667,7.62,0.5732,0.2197,1.1982,95.65,0,0,0,242x242,rawvideo,260.46,3.0087
+crop_242x242_ffv1,99.646,99.3164,0.3296,0.5307,0.8283,-0.0667,7.62,0.5732,0.2197,1.1982,95.65,0,0,0,242x242,ffv1,74.74,0.8634
